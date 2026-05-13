@@ -8,7 +8,8 @@ A collection of Claude Code / agent skills for statistical-genetics workflows, b
 |---|---|
 | [`liftover/`](liftover/) | KG-aware genomic liftover for GWAS sumstats. Resolves source/target build via the OKG when available; falls back to the GWAS Catalog REST API. Refuses unknown-provenance lifts and emits a coverage-gap proposal stub. Supports `--gcst <accession>` for direct GWAS-Catalog fetch+lift. |
 | [`gwas-fetch/`](gwas-fetch/) | Fetch harmonised GWAS Catalog sumstats by accession (`GCST*`). OKG-first metadata resolution with REST-API fallback. Caches downloads + writes a `.fetch.json` provenance manifest. Compose with `liftover` for build alignment. |
-| [`ldsc/`](ldsc/) | Run LD Score Regression: `munge` raw sumstats, estimate SNP heritability (`h2`), compute genetic correlation (`rg`). Auto-installs the CBIIT Python 3 / Mac-compatible LDSC fork; caches the canonical EUR LD-score reference; writes a `.ldsc.json` sidecar with OKG provenance and parsed key results. |
+| [`ldsc/`](ldsc/) | Run LD Score Regression: `munge` raw sumstats, estimate SNP heritability (`h2`), compute genetic correlation (`rg`). Auto-installs the CBIIT LDSC fork; caches the canonical EUR LD-score reference; writes a `.ldsc.json` sidecar with OKG provenance and parsed key results. |
+| [`finemap/`](finemap/) | SuSiE / SuShiE fine-mapping via the `mancusolab/sushie` package. Subcommands: `susie` (single-ancestry, individual genotypes), `sushie` (multi-ancestry K≥2), `sumstats` (GWAS Z + LD via `infer_sushie_ss`, works for K=1 SuSiE-RSS or K≥2 SuShiE). Auto-installs sushie + runs the bundled 3-ancestry tutorial as a smoke test; writes a `.finemap.json` sidecar with OKG provenance and parsed CS/PIP summary. |
 
 ## Installation
 
