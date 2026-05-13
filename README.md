@@ -10,15 +10,15 @@ A collection of Claude Code / agent skills for statistical-genetics workflows, b
 
 ## Installation
 
-The skills follow the [agentskills.io spec](https://agentskills.io/specification), so they should work with any compatible agent (Claude Code, Cursor, Goose, OpenCode, etc.).
+The skills follow the [Agent Skills](https://agentskills.io/specification) specification, so they should work with any compatible agent (Claude Code, Cursor, Goose, OpenCode, etc.).
 
 ### Claude Code (user-level)
 
 Symlink each skill into `~/.claude/skills/`:
 
 ```bash
-git clone https://github.com/<you>/statgen-skills ~/Lab/KG/statgen-skills
-cd ~/Lab/KG/statgen-skills
+git clone https://github.com/svdorn/statgen-skills.git
+cd statgen-skills
 ./install.sh                  # symlinks all skills into ~/.claude/skills/
 ```
 
@@ -32,7 +32,7 @@ After symlinking, restart Claude Code (or the agent client) so it picks up the n
 
 ### Other agentskills.io-compatible clients
 
-Point your client at `~/Lab/KG/statgen-skills/<skill>` or copy individual skills into the client's skills directory. Each skill's `SKILL.md` documents its `compatibility` field for any environment requirements.
+Point your client at `statgen-skills/<skill>` or copy individual skills into the client's skills directory. Each skill's `SKILL.md` documents its `compatibility` field for any environment requirements.
 
 ## Skill development
 
