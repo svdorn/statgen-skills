@@ -171,15 +171,26 @@ def resolve_okg_node_ids(okg_repo: Optional[Path]) -> dict:
                          "clientInfo": {"name": "ldsc-skill", "version": "0.1"}}})
         read()
         send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        for nid in ("method:ldsc", "software:ldsc", "paper:ldsc_2015"):
+        # method:ldsc, paper:ldsc_2015: canonical.
+        # software:ldsc: upstream bulik/ldsc.
+        # software:ldsc_cbiit: the Python-3 / macOS-arm64 fork that this
+        #   skill actually installs and runs. Recorded as software_operational
+        #   on the manifest so the provenance trail names the running fork.
+        for nid in ("method:ldsc", "software:ldsc", "software:ldsc_cbiit",
+                     "paper:ldsc_2015"):
             send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
                   "params": {"name": "get_node",
                              "arguments": {"node_id": nid}}})
             resp = read()
             sc = resp.get("result", {}).get("structuredContent") or {}
             if sc.get("node_id") == nid:
-                kind = nid.split(":", 1)[0]
-                out[kind] = nid
+                if nid == "software:ldsc_cbiit":
+                    out["software_operational"] = nid
+                elif nid == "software:ldsc":
+                    out["software_upstream"] = nid
+                else:
+                    kind = nid.split(":", 1)[0]
+                    out[kind] = nid
     finally:
         try: proc.stdin.close()
         except Exception: pass
