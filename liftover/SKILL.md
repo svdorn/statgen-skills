@@ -2,7 +2,7 @@
 name: liftover
 description: KG-aware genomic liftover for GWAS summary statistics. Resolves source/target genome build (hg18/hg19/hg38) via the statgen-analysis OKG when available, falling back to the GWAS Catalog REST API. Refuses to lift unknown-provenance data and emits a coverage-gap proposal stub. Supports `--gcst <accession>` to fetch+lift directly from the GWAS Catalog. Use when a user asks to lift a sumstats file, asks whether a lift is needed for a GWAS/LD pair, or asks to fetch a GWAS Catalog study and align its build to an LD panel.
 license: MIT
-compatibility: Requires Python 3.9+ and uv (or pip). Installs pyliftover on first use. OKG resolution requires the statgen-analysis OKG MCP server reachable at the path given via OKG_REPO env var (default /Users/stephen/Lab/KG/okg).
+compatibility: Requires Python 3.9+ and uv (or pip). Installs pyliftover on first use. OKG resolution requires the user to set $OKG_REPO (or pass --okg-repo) to a local clone of an `okg` repo with a deployment exposing an MCP server at deployments/<deployment>/server.py (e.g. statgen-analysis). The skill refuses any --okg-* / --gcst invocation when $OKG_REPO is unset.
 metadata:
   author: stephendorn
   version: "0.2"

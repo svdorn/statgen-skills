@@ -1,6 +1,6 @@
 # statgen-skills
 
-A collection of Claude Code / agent skills for statistical-genetics workflows, built to the [agentskills.io](https://agentskills.io) standard. Each skill is a self-contained directory with a `SKILL.md` + helper scripts.
+A collection of Claude Code / agent skills for statistical-genetics workflows, built to the [Agent Skills](https://agentskills.io) standard. Each skill is a self-contained directory with a `SKILL.md` + helper scripts.
 
 ## Available skills
 
@@ -25,7 +25,7 @@ cd statgen-skills
 Or symlink a single skill:
 
 ```bash
-ln -s ~/Lab/KG/statgen-skills/liftover ~/.claude/skills/liftover
+ln -s ~/statgen-skills/liftover ~/.claude/skills/liftover
 ```
 
 After symlinking, restart Claude Code (or the agent client) so it picks up the new skills at startup.
@@ -55,7 +55,16 @@ skills-ref validate ./liftover
 
 ## OKG integration
 
-Several skills here are designed around the **statgen-analysis OKG** at [github.com/mitdbg/okg](https://github.com/mitdbg/okg/tree/main/deployments/statgen-analysis). They spawn the OKG MCP server (default path: `/Users/stephen/Lab/KG/okg`; override via `OKG_REPO` env var) and query for provenance metadata before acting. When the OKG can't resolve a needed entity, skills emit a coverage-gap proposal stub instead of guessing — see each skill's `references/COVERAGE_GAPS.md` for the workflow.
+Several skills here are designed around an **OKG** (Operational Knowledge Graph) — the upstream reference is [github.com/mitdbg/okg](https://github.com/mitdbg/okg/tree/main/deployments/statgen-analysis), but any fork or compatible deployment works. To use OKG-aware features, set the `OKG_REPO` environment variable to your local clone:
+
+```bash
+git clone https://github.com/mitdbg/okg ~/Lab/KG/okg   # or your fork
+export OKG_REPO=~/Lab/KG/okg
+```
+
+The skills then spawn the OKG MCP server at `$OKG_REPO/deployments/<deployment>/server.py` (default deployment: `statgen-analysis`) and query for provenance metadata before acting. When the OKG can't resolve a needed entity, skills emit a coverage-gap proposal stub instead of guessing — see each skill's `references/COVERAGE_GAPS.md` for the workflow.
+
+If `$OKG_REPO` is not set and a skill is invoked with an `--okg-*` flag, the skill refuses with a clear error pointing you here. Skills can still run **without** the OKG by passing all required metadata explicitly (e.g. `--source hg38 --target hg19` for liftover).
 
 ## License
 

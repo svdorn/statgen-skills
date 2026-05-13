@@ -17,7 +17,7 @@ This mirrors the pattern used by the statgen-analysis benchmark harness's `okg_p
 3. **Scaffold a paired OpenSpec change** in the okg repo:
 
    ```bash
-   cd /Users/stephen/Lab/KG/okg
+   cd "$OKG_REPO"   # set $OKG_REPO to your local okg clone
    openspec new change add-dataset-<slug>
    ```
 
