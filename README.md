@@ -6,7 +6,9 @@ A collection of Claude Code / agent skills for statistical-genetics workflows, b
 
 | Skill | Purpose |
 |---|---|
-| [`liftover/`](liftover/) | KG-aware genomic liftover for GWAS sumstats. Resolves source/target build via the statgen-analysis OKG when available; falls back to the GWAS Catalog REST API. Refuses unknown-provenance lifts and emits a coverage-gap proposal stub. Supports `--gcst <accession>` for direct GWAS-Catalog fetch+lift. |
+| [`liftover/`](liftover/) | KG-aware genomic liftover for GWAS sumstats. Resolves source/target build via the OKG when available; falls back to the GWAS Catalog REST API. Refuses unknown-provenance lifts and emits a coverage-gap proposal stub. Supports `--gcst <accession>` for direct GWAS-Catalog fetch+lift. |
+| [`gwas-fetch/`](gwas-fetch/) | Fetch harmonised GWAS Catalog sumstats by accession (`GCST*`). OKG-first metadata resolution with REST-API fallback. Caches downloads + writes a `.fetch.json` provenance manifest. Compose with `liftover` for build alignment. |
+| [`ldsc/`](ldsc/) | Run LD Score Regression: `munge` raw sumstats, estimate SNP heritability (`h2`), compute genetic correlation (`rg`). Auto-installs the CBIIT Python 3 / Mac-compatible LDSC fork; caches the canonical EUR LD-score reference; writes a `.ldsc.json` sidecar with OKG provenance and parsed key results. |
 
 ## Installation
 
