@@ -71,6 +71,55 @@ def _probe_harmonised_url(ftp_dir: str, accession: str) -> Optional[str]:
     return url + chosen
 
 
+def _probe_root_sumstats_url(ftp_dir: str,
+                              accession: str) -> Optional[tuple[str, Optional[str]]]:
+    """Fallback for deposits that don't ship a harmonised/ subdirectory.
+
+    Lists the GCST root and picks the first `*build*.tsv.gz` (or any
+    `*.tsv.gz`) it finds. Returns `(url, parsed_build)` where parsed_build
+    is the build extracted from the filename when present (e.g. `_buildGRCh37`)
+    or None. Harmonised lookups should be preferred over this — only fall
+    back here when the harmonised path is empty."""
+    url = ftp_dir.rstrip("/") + "/"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as r:
+            html = r.read().decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    candidates = [
+        m.group(1) for m in re.finditer(r'href="([^"]+\.tsv\.gz)"', html)
+    ]
+    # Skip metadata/index files; only keep actual data tarballs.
+    candidates = [
+        c for c in candidates
+        if not c.endswith(("-meta.yaml.gz", ".tbi"))
+        and ".tsv.gz" in c
+    ]
+    if not candidates:
+        return None
+    preferred = [c for c in candidates if accession in c]
+    chosen = (preferred or candidates)[0]
+    parsed_build = None
+    m = re.search(r"_build(GRCh3[78]|hg1[89])", chosen, re.IGNORECASE)
+    if m:
+        parsed_build = normalize_build(m.group(1))
+    return url + chosen, parsed_build
+
+
+def gwas_catalog_studies_by_pmid(pmid: str) -> list:
+    """Return a list of accessionIds for all GWAS Catalog studies under
+    the given PubMed ID."""
+    api = ("https://www.ebi.ac.uk/gwas/rest/api/studies/search/"
+            f"findByPublicationIdPubmedId?pubmedId={pmid}&size=200")
+    try:
+        with urllib.request.urlopen(api, timeout=30) as r:
+            payload = json.loads(r.read())
+    except Exception as e:
+        raise RuntimeError(f"PubMed ID lookup failed for {pmid}: {e}")
+    studies = payload.get("_embedded", {}).get("studies", [])
+    return [s["accessionId"] for s in studies if s.get("accessionId")]
+
+
 def _looks_like_sumstats_url(url: Optional[str]) -> bool:
     """True if `url` points at a sumstats file (FTP tsv/csv/parquet) and
     not at the catalog landing page or REST endpoint."""
@@ -150,12 +199,18 @@ def catalog_api_lookup(accession: str) -> dict:
     Raises RuntimeError on HTTP failure.
     """
     study_url = f"https://www.ebi.ac.uk/gwas/rest/api/studies/{accession}"
+    # REST is best-effort: it gives us first_author / pmid / build for the
+    # manifest but isn't required to construct a download URL. The FTP path
+    # is derived from the accession bucket alone, and the build can be
+    # parsed from the filename when REST fails or omits it.
+    study = {}
     try:
         with urllib.request.urlopen(study_url, timeout=30) as r:
             study = json.loads(r.read())
     except Exception as e:
-        raise RuntimeError(f"GWAS Catalog REST lookup failed for "
-                            f"{accession}: {e}")
+        print(f"warning: GWAS Catalog REST lookup for {accession} failed "
+              f"({type(e).__name__}); falling back to FTP-only resolution",
+              file=sys.stderr)
     build = None
     for key in ("summaryStatisticsAssembly", "genomeAssembly",
                  "summary_statistics_assembly"):
@@ -187,6 +242,20 @@ def catalog_api_lookup(accession: str) -> dict:
     # Probe the FTP harmonised directory to pick the actual `.h.tsv.gz`.
     if ss_url is None and ftp_dir is not None:
         ss_url = _probe_harmonised_url(ftp_dir, accession)
+    # If we resolved a harmonised URL but REST didn't give us a build,
+    # default to GRCh38 — the GWAS Catalog harmonisation pipeline always
+    # emits files on GRCh38.
+    if ss_url is not None and "/harmonised/" in ss_url and build is None:
+        build = "hg38"
+    # Fallback: some deposits (older, non-harmonised) put the file at
+    # <bucket>/<GCST>/GCST*_buildXXX.tsv.gz without a `/harmonised/` dir.
+    # Prefer harmonised; only use this when harmonised lookup is empty.
+    if ss_url is None and ftp_dir is not None:
+        probe = _probe_root_sumstats_url(ftp_dir, accession)
+        if probe is not None:
+            ss_url, parsed_build = probe
+            if build is None and parsed_build:
+                build = parsed_build
     return {
         "accession": accession,
         "genome_build": build,
@@ -250,8 +319,12 @@ def sha256(path: Path) -> str:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--gcst", type=str, required=True,
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--gcst", type=str,
                    help="GWAS Catalog accession, e.g. GCST90704615")
+    group.add_argument("--pubmed-id", type=str,
+                   help="PubMed ID; resolves to all GCSTs under that paper "
+                        "via the GWAS Catalog REST API and fetches each.")
     p.add_argument("--cache-dir", type=Path,
                    default=Path.home() / ".cache" / "gwas-catalog")
     p.add_argument("--refresh", action="store_true",
@@ -263,6 +336,27 @@ def main() -> int:
     args = p.parse_args()
 
     args.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # --pubmed-id: resolve to a list of GCSTs and recurse on each.
+    if args.pubmed_id:
+        try:
+            accessions = gwas_catalog_studies_by_pmid(args.pubmed_id)
+        except RuntimeError as e:
+            sys.exit(f"REFUSED: {e}")
+        if not accessions:
+            sys.exit(f"REFUSED: no GWAS Catalog studies found for "
+                     f"PubMed ID {args.pubmed_id}.")
+        print(f"[pubmed-id {args.pubmed_id}] resolved {len(accessions)} GCSTs: "
+              f"{', '.join(accessions)}", file=sys.stderr)
+        rc = 0
+        for acc in accessions:
+            args.gcst = acc
+            rc |= _fetch_one(args)
+        return rc
+    return _fetch_one(args)
+
+
+def _fetch_one(args) -> int:
 
     okg_hit = None
     if args.okg_repo is not None:
