@@ -396,6 +396,18 @@ def _merge_ignore_into_extras(extras: list, auto_ignore: list) -> list:
 # ---------------------------- Subcommands ----------------------------
 
 def run_munge(args, repo_dir: Path, okg_node_ids: dict) -> int:
+    # No-clobber: if <out>.sumstats.gz exists already, skip the re-munge
+    # (idempotent across invocations). Honor --refresh to force.
+    out_sumstats = Path(f"{args.out}.sumstats.gz")
+    if out_sumstats.exists() and not getattr(args, "refresh", False):
+        print(f"[ldsc munge] {out_sumstats} already exists; skipping. "
+              f"Pass --refresh to re-munge.", file=sys.stderr)
+        log = Path(str(args.out) + ".log")
+        summary = _parse_munge_log(log) if log.exists() else {}
+        _write_manifest(args.out, "munge", args, repo_dir, None, summary,
+                         okg_node_ids)
+        return 0
+
     # Pre-flight: drop --frq-col if the column is 100% NA in this file.
     frq_col = args.frq_col
     if frq_col and getattr(args, "frq_precheck", True):
