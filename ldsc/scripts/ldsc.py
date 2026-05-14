@@ -298,9 +298,131 @@ def resolve_okg_ld_panel(okg_repo: Optional[Path],
     }
 
 
+# ---------------------------- Sumstats pre-flight ----------------------------
+
+# Columns LDSC's auto-matcher recognises and that the GWAS Catalog harmonised
+# files duplicate with a `hm_` prefix. Used by the auto-ignore precheck.
+_LDSC_RELEVANT_COLS = (
+    "effect_allele", "other_allele", "beta", "odds_ratio",
+    "effect_allele_frequency", "p_value", "se", "standard_error",
+    "z", "info",
+)
+
+_NA_TOKENS = {"NA", "", "nan", "NaN", "N/A", ".", "null", "None"}
+
+
+def _read_header(path: Path) -> list:
+    """Read the header row of a TSV (gz-aware) as a list of column names."""
+    import csv
+    import gzip
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt") as f:
+        return next(csv.reader(f, delimiter="\t"))
+
+
+def _column_is_all_na(path: Path, col: str, sample: int = 50_000) -> bool:
+    """Return True if `col` is 100% NA across the first `sample` rows.
+    Returns False if the column is missing (let downstream report the
+    error) or has any non-NA value."""
+    import csv
+    import gzip
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt") as f:
+        reader = csv.reader(f, delimiter="\t")
+        try:
+            header = next(reader)
+        except StopIteration:
+            return False
+        if col not in header:
+            return False
+        idx = header.index(col)
+        for i, row in enumerate(reader):
+            if i >= sample:
+                break
+            if idx >= len(row):
+                continue
+            if row[idx].strip() not in _NA_TOKENS:
+                return False
+    return True
+
+
+def _auto_ignore_non_harmonised(path: Path, chosen_cols: list) -> list:
+    """For each user-chosen `hm_*` column whose non-hm sibling exists in the
+    same file, return the non-hm name so it can be added to --ignore.
+    Also catches LDSC-relevant cols (beta, p_value, etc.) that are present
+    in both hm_ and bare forms even when the user didn't explicitly pick the
+    hm_ version. Returns deduped list, sorted for determinism."""
+    chosen_hm = [c for c in chosen_cols if c and c.startswith("hm_")]
+    if not chosen_hm:
+        # Without an hm_* signal from the user, don't second-guess: the file
+        # might not be a GWAS-Catalog harmonised file at all.
+        return []
+    try:
+        header = _read_header(path)
+    except Exception:
+        return []
+    header_set = set(header)
+    ignore = set()
+    # User picked hm_X — drop its non-hm sibling if present.
+    for hm_col in chosen_hm:
+        non_hm = hm_col[3:]
+        if non_hm in header_set:
+            ignore.add(non_hm)
+    # Also catch other LDSC-recognised cols that appear in both forms.
+    for col in _LDSC_RELEVANT_COLS:
+        if f"hm_{col}" in header_set and col in header_set:
+            ignore.add(col)
+    return sorted(ignore)
+
+
+def _merge_ignore_into_extras(extras: list, auto_ignore: list) -> list:
+    """Merge auto-detected ignore columns with any --ignore the user passed
+    through extras. Returns the new extras list (with --ignore <merged>)."""
+    if not auto_ignore:
+        return extras
+    out = list(extras)
+    # Find an existing --ignore and merge.
+    for i, tok in enumerate(out):
+        if tok == "--ignore" and i + 1 < len(out):
+            user_set = {c.strip() for c in out[i + 1].split(",") if c.strip()}
+            merged = sorted(user_set | set(auto_ignore))
+            out[i + 1] = ",".join(merged)
+            return out
+    # No existing --ignore — append one.
+    out.extend(["--ignore", ",".join(auto_ignore)])
+    return out
+
+
 # ---------------------------- Subcommands ----------------------------
 
 def run_munge(args, repo_dir: Path, okg_node_ids: dict) -> int:
+    # Pre-flight: drop --frq-col if the column is 100% NA in this file.
+    frq_col = args.frq_col
+    if frq_col and getattr(args, "frq_precheck", True):
+        if _column_is_all_na(Path(args.input), frq_col):
+            print(f"[ldsc munge] warning: column {frq_col!r} is 100% NA in "
+                  f"the first 50k rows of {args.input}; dropping --frq-col "
+                  f"(LDSC drops every row when the frequency column is NA). "
+                  f"Pass --no-frq-precheck to keep it.", file=sys.stderr)
+            frq_col = None
+
+    # Pre-flight: auto-add --ignore for non-harmonised duplicates when the
+    # user picked hm_* columns from a GWAS-Catalog harmonised file.
+    extras = _strip_dashdash(args.extra or [])
+    if getattr(args, "auto_ignore_harmonised", True):
+        chosen_cols = [args.snp_col, args.a1_col, args.a2_col, args.p_col,
+                        frq_col, args.N_col]
+        if args.signed_sumstats:
+            chosen_cols.append(args.signed_sumstats.split(",", 1)[0])
+        auto_ignore = _auto_ignore_non_harmonised(Path(args.input),
+                                                    chosen_cols)
+        if auto_ignore:
+            print(f"[ldsc munge] auto-detected GWAS-Catalog harmonised file; "
+                  f"adding --ignore {','.join(auto_ignore)} (non-hm duplicates "
+                  f"of LDSC-recognised columns). Pass --no-auto-ignore to "
+                  f"disable.", file=sys.stderr)
+            extras = _merge_ignore_into_extras(extras, auto_ignore)
+
     cmd = [sys.executable, str(repo_dir / "munge_sumstats.py"),
            "--sumstats", str(args.input),
            "--out", str(args.out)]
@@ -316,12 +438,12 @@ def run_munge(args, repo_dir: Path, okg_node_ids: dict) -> int:
         cmd.extend(["--a2", args.a2_col])
     if args.p_col is not None:
         cmd.extend(["--p", args.p_col])
-    if args.frq_col is not None:
-        cmd.extend(["--frq", args.frq_col])
+    if frq_col is not None:
+        cmd.extend(["--frq", frq_col])
     if args.signed_sumstats:
         cmd.extend(["--signed-sumstats", args.signed_sumstats])
-    if args.extra:
-        cmd.extend(_strip_dashdash(args.extra))
+    if extras:
+        cmd.extend(extras)
     print(f"[ldsc munge] {' '.join(cmd)}", file=sys.stderr)
     rc = subprocess.call(cmd)
     log = Path(str(args.out) + ".log")
@@ -497,6 +619,17 @@ def main() -> int:
                     help="Effect allele frequency column")
     pm.add_argument("--signed-sumstats", type=str, default=None,
                     help="LDSC's --signed-sumstats flag value (e.g. 'beta,0')")
+    pm.add_argument("--no-frq-precheck", dest="frq_precheck",
+                    action="store_false",
+                    help="Skip the 'is --frq-col all NA?' precheck. By default "
+                         "the skill drops --frq-col when the column has no "
+                         "non-NA values in the first 50k rows.")
+    pm.add_argument("--no-auto-ignore", dest="auto_ignore_harmonised",
+                    action="store_false",
+                    help="Skip the GWAS-Catalog-harmonised auto --ignore. By "
+                         "default the skill adds non-hm duplicates of "
+                         "LDSC-recognised columns to --ignore when the user "
+                         "chose at least one hm_* column.")
     _add_common(pm)
 
     ph = sub.add_parser("h2", help="Estimate SNP heritability")
