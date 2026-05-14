@@ -60,7 +60,29 @@ def ensure_ldsc_repo(repo_url: str, commit: Optional[str],
         subprocess.check_call(
             ["git", "checkout", commit], cwd=repo_dir, stdout=sys.stderr,
         )
+    _patch_ldsc_repo(repo_dir)
     return repo_dir
+
+
+def _patch_ldsc_repo(repo_dir: Path) -> None:
+    """Apply small Py3 / pandas-compat patches to the cloned LDSC fork.
+
+    Both upstream `bulik/ldsc` and the CBIIT `Python 3` fork still ship a
+    `read_header` that decodes gzipped bytes as if they were `str`. We
+    monkey-patch the clone in place so munge_sumstats.py works on .gz
+    inputs. Idempotent: applies only if the buggy line is still present.
+    """
+    ms = repo_dir / "munge_sumstats.py"
+    if not ms.exists():
+        return
+    src = ms.read_text()
+    bad = "return [x.rstrip('\\n') for x in openfunc(fh).readline().split()]"
+    fix = ("line = openfunc(fh).readline()\n    "
+            "if isinstance(line, bytes):\n        line = line.decode('utf-8')\n    "
+            "return [x.rstrip('\\n') for x in line.split()]")
+    if bad in src and fix.split("\n")[0] not in src:
+        ms.write_text(src.replace(bad, fix))
+        print(f"  patched read_header in {ms}", file=sys.stderr)
 
 
 def get_repo_commit(repo_dir: Path) -> str:
@@ -97,11 +119,23 @@ def ensure_python_deps() -> None:
 def ensure_ld_scores(ld_scores_dir: Optional[Path],
                      cache_root: Path,
                      url: str = DEFAULT_LD_SCORES_URL,
-                     refresh: bool = False) -> tuple[Path, str]:
-    """Return (ld_scores_dir, sha256). Downloads + extracts on first use."""
+                     refresh: bool = False,
+                     okg_panel: Optional[dict] = None) -> tuple[Path, str]:
+    """Return (ld_scores_dir, sha256). Resolution order:
+       1) explicit --ld-scores-dir if it exists,
+       2) OKG ld_panel.local_path_hint if it exists locally,
+       3) default cache path (~/.cache/ldsc/ld_scores/eur_w_ld_chr),
+       4) download from `url` and extract.
+    """
     if ld_scores_dir is not None and ld_scores_dir.exists():
         sha = _sha256_of_dir(ld_scores_dir)
         return ld_scores_dir, sha
+    if okg_panel and okg_panel.get("local_path_hint"):
+        hint = Path(os.path.expanduser(okg_panel["local_path_hint"]))
+        if hint.exists():
+            print(f"using OKG-resolved LD path: {hint} "
+                  f"(from {okg_panel.get('node_id')})", file=sys.stderr)
+            return hint, _sha256_of_dir(hint)
     default = cache_root / "ld_scores" / "eur_w_ld_chr"
     if default.exists() and not refresh:
         return default, _sha256_of_dir(default)
@@ -111,7 +145,17 @@ def ensure_ld_scores(ld_scores_dir: Optional[Path],
         tarball.unlink()
     if not tarball.exists():
         print(f"downloading {url} -> {tarball} (~46 MB)", file=sys.stderr)
-        urllib.request.urlretrieve(url, tarball)
+        try:
+            urllib.request.urlretrieve(url, tarball)
+        except Exception as e:
+            msg = (f"ERROR: failed to download LD scores from {url}: {e}.")
+            if okg_panel and okg_panel.get("source_url"):
+                msg += (f"\n  OKG ld_panel {okg_panel.get('node_id')} also "
+                        f"points at {okg_panel['source_url']} — that link may "
+                        f"require manual download; place the extracted "
+                        f"eur_w_ld_chr/ dir at "
+                        f"{default} or pass --ld-scores-dir <path>.")
+            sys.exit(msg)
     sha = hashlib.sha256()
     with open(tarball, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
@@ -199,6 +243,61 @@ def resolve_okg_node_ids(okg_repo: Optional[Path]) -> dict:
     return out
 
 
+def _strip_dashdash(extras: list) -> list:
+    """Drop a literal '--' separator from REMAINDER-captured extras so it
+    isn't forwarded into the underlying LDSC CLI (which doesn't expect it)."""
+    return [a for a in extras if a != "--"]
+
+
+def resolve_okg_ld_panel(okg_repo: Optional[Path],
+                          panel_id: str) -> Optional[dict]:
+    """Query the OKG for an ld_panel node and return its attrs
+    (specifically local_path_hint + source_url). Returns None if the OKG
+    isn't reachable or the node doesn't exist."""
+    if okg_repo is None:
+        return None
+    if not (okg_repo / "deployments/statgen-analysis/server.py").exists():
+        return None
+    env = os.environ.copy()
+    env.setdefault("OKG_DSN",
+                   "postgres://postgres:okg@localhost:5449/statgen_analysis")
+    proc = subprocess.Popen(
+        ["uv", "run", "--extra", "mcp", "python",
+         "deployments/statgen-analysis/server.py"],
+        cwd=str(okg_repo), env=env,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, text=True, bufsize=1,
+    )
+    def send(m): proc.stdin.write(json.dumps(m) + "\n"); proc.stdin.flush()
+    def read(): return json.loads(proc.stdout.readline())
+    try:
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                         "clientInfo": {"name": "ldsc-skill", "version": "0.1"}}})
+        read()
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+              "params": {"name": "get_node",
+                         "arguments": {"node_id": panel_id}}})
+        resp = read()
+    finally:
+        try: proc.stdin.close()
+        except Exception: pass
+        try: proc.wait(timeout=3)
+        except subprocess.TimeoutExpired: proc.terminate()
+    sc = resp.get("result", {}).get("structuredContent") or {}
+    if sc.get("node_id") != panel_id:
+        return None
+    a = sc.get("attrs") or {}
+    return {
+        "node_id": panel_id,
+        "local_path_hint": a.get("local_path_hint"),
+        "source_url": a.get("source_url"),
+        "name": a.get("name"),
+        "genome_build": a.get("genome_build"),
+    }
+
+
 # ---------------------------- Subcommands ----------------------------
 
 def run_munge(args, repo_dir: Path, okg_node_ids: dict) -> int:
@@ -222,7 +321,7 @@ def run_munge(args, repo_dir: Path, okg_node_ids: dict) -> int:
     if args.signed_sumstats:
         cmd.extend(["--signed-sumstats", args.signed_sumstats])
     if args.extra:
-        cmd.extend(args.extra)
+        cmd.extend(_strip_dashdash(args.extra))
     print(f"[ldsc munge] {' '.join(cmd)}", file=sys.stderr)
     rc = subprocess.call(cmd)
     log = Path(str(args.out) + ".log")
@@ -240,7 +339,7 @@ def run_h2(args, repo_dir: Path, ld_scores_dir: Path, ld_sha: str,
            "--w-ld-chr", str(ld_scores_dir) + "/",
            "--out", str(args.out)]
     if args.extra:
-        cmd.extend(args.extra)
+        cmd.extend(_strip_dashdash(args.extra))
     print(f"[ldsc h2] {' '.join(cmd)}", file=sys.stderr)
     rc = subprocess.call(cmd)
     log = Path(str(args.out) + ".log")
@@ -260,7 +359,7 @@ def run_rg(args, repo_dir: Path, ld_scores_dir: Path, ld_sha: str,
            "--w-ld-chr", str(ld_scores_dir) + "/",
            "--out", str(args.out)]
     if args.extra:
-        cmd.extend(args.extra)
+        cmd.extend(_strip_dashdash(args.extra))
     print(f"[ldsc rg] {' '.join(cmd)}", file=sys.stderr)
     rc = subprocess.call(cmd)
     log = Path(str(args.out) + ".log")
@@ -361,6 +460,11 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                    help=f"Cache root (default: {CACHE_ROOT})")
     p.add_argument("--ld-scores-dir", type=Path, default=None,
                    help="Path to an eur_w_ld_chr/-style dir; default: auto-download")
+    p.add_argument("--okg-ld-panel-id", type=str,
+                   default="ld_panel:ldsc_eur_w_ld_chr",
+                   help="OKG ld_panel node ID to resolve local_path_hint + "
+                        "source_url from (when $OKG_REPO is set). Pass empty "
+                        "string to disable.")
     p.add_argument("--refresh", action="store_true",
                    help="Force re-clone of LDSC + re-download of LD scores")
     p.add_argument("--okg-repo", type=Path,
@@ -417,9 +521,14 @@ def main() -> int:
 
     if args.subcmd == "munge":
         return run_munge(args, repo_dir, okg_node_ids)
+    okg_panel = (resolve_okg_ld_panel(args.okg_repo, args.okg_ld_panel_id)
+                  if args.okg_ld_panel_id else None)
     ld_dir, ld_sha = ensure_ld_scores(args.ld_scores_dir,
                                        Path(args.repo_cache),
-                                       refresh=args.refresh)
+                                       refresh=args.refresh,
+                                       okg_panel=okg_panel)
+    if okg_panel:
+        okg_node_ids["ld_panel"] = okg_panel["node_id"]
     if args.subcmd == "h2":
         return run_h2(args, repo_dir, ld_dir, ld_sha, okg_node_ids)
     if args.subcmd == "rg":
