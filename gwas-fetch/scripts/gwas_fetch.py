@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+import re
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,53 @@ def normalize_build(b: Optional[str]) -> Optional[str]:
     if b is None:
         return None
     return BUILD_ALIASES.get(b.lower().strip())
+
+
+def _gwas_catalog_ftp_dir(accession: str) -> Optional[str]:
+    """Return the FTP base for a GCST accession using the bucket layout
+    GCST<lo>-GCST<hi>/<accession>/, where the bucket is the 1000-sized
+    window containing the numeric accession (lo=floor((n-1)/1000)*1000+1)."""
+    m = re.match(r"GCST(\d+)$", accession)
+    if not m:
+        return None
+    n = int(m.group(1))
+    lo = ((n - 1) // 1000) * 1000 + 1
+    hi = lo + 999
+    return ("https://ftp.ebi.ac.uk/pub/databases/gwas/summary_statistics/"
+            f"GCST{lo:06d}-GCST{hi:06d}/{accession}/")
+
+
+def _probe_harmonised_url(ftp_dir: str, accession: str) -> Optional[str]:
+    """List the harmonised/ subdirectory and pick the .h.tsv.gz file."""
+    url = ftp_dir.rstrip("/") + "/harmonised/"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as r:
+            html = r.read().decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    candidates = [
+        m.group(1) for m in re.finditer(r'href="([^"]+\.h\.tsv\.gz)"', html)
+    ]
+    if not candidates:
+        return None
+    # Prefer files that mention the accession (defensive against indexing).
+    preferred = [c for c in candidates if accession in c]
+    chosen = (preferred or candidates)[0]
+    return url + chosen
+
+
+def _looks_like_sumstats_url(url: Optional[str]) -> bool:
+    """True if `url` points at a sumstats file (FTP tsv/csv/parquet) and
+    not at the catalog landing page or REST endpoint."""
+    if not url:
+        return False
+    u = url.lower()
+    if u.endswith((".tsv.gz", ".tsv", ".csv.gz", ".csv",
+                    ".parquet", ".vcf.gz", ".h.tsv.gz")):
+        return True
+    if "/harmonised/" in u or "ftp.ebi.ac.uk" in u:
+        return True
+    return False
 
 
 def okg_lookup(accession: str, okg_repo: Path) -> Optional[dict]:
@@ -73,17 +121,25 @@ def okg_lookup(accession: str, okg_repo: Path) -> Optional[dict]:
         except subprocess.TimeoutExpired: proc.terminate()
     sc = resp.get("result", {}).get("structuredContent") or {}
     for hit in sc.get("results", []):
-        if hit.get("subtype") in ("dataset_metadata", "paper"):
-            a = hit.get("attrs") or {}
-            return {
-                "node_id": hit.get("node_id"),
-                "subtype": hit.get("subtype"),
-                "genome_build": normalize_build(a.get("genome_build")),
-                "source_url": a.get("source_url"),
-                "provider": a.get("provider"),
-                "sample_size": a.get("sample_size"),
-                "ancestry": a.get("ancestry_scope") or a.get("ancestry"),
-            }
+        # MCP search returns the alias hit at the top level and the
+        # resolved node nested under `node`. Some older deployments
+        # return node fields at the top level; handle both.
+        node = hit.get("node") or hit
+        subtype = node.get("subtype")
+        if subtype not in ("dataset_metadata", "paper"):
+            continue
+        a = node.get("attrs") or {}
+        return {
+            "node_id": node.get("node_id"),
+            "subtype": subtype,
+            "genome_build": normalize_build(a.get("genome_build")),
+            "source_url": a.get("source_url"),
+            "provider": a.get("provider"),
+            "sample_size": a.get("sample_size") or a.get("initial_sample_size"),
+            "ancestry": a.get("ancestry_scope") or a.get("ancestry"),
+            "summary_statistics_url": a.get("summary_statistics_url"),
+            "accession": a.get("accession"),
+        }
     return None
 
 
@@ -108,11 +164,9 @@ def catalog_api_lookup(accession: str) -> dict:
     info = study.get("publicationInfo") or {}
     first_author = (info.get("author") or {}).get("fullname")
     pmid = info.get("pubmedId")
-    ftp_dir = None
-    if first_author and pmid:
-        surname = first_author.split()[-1].lower()
-        ftp_dir = (f"https://ftp.ebi.ac.uk/pub/databases/gwas/"
-                   f"summary_statistics/{surname}_{pmid}/{accession}/")
+    # GWAS Catalog FTP layout: GCST<bucket-lo>-GCST<bucket-hi>/<accession>/harmonised/
+    # where bucket = 1000-sized window around the accession number.
+    ftp_dir = _gwas_catalog_ftp_dir(accession)
     # Best-effort URL probe via the summary-statistics API.
     ss_url = None
     try:
@@ -130,8 +184,9 @@ def catalog_api_lookup(accession: str) -> dict:
                     ss_url = embedded[0][key]; break
     except Exception:
         pass
+    # Probe the FTP harmonised directory to pick the actual `.h.tsv.gz`.
     if ss_url is None and ftp_dir is not None:
-        ss_url = f"{ftp_dir}harmonised/{accession}.h.tsv.gz"
+        ss_url = _probe_harmonised_url(ftp_dir, accession)
     return {
         "accession": accession,
         "genome_build": build,
@@ -213,9 +268,16 @@ def main() -> int:
     if args.okg_repo is not None:
         okg_hit = okg_lookup(args.gcst, args.okg_repo)
 
+    # Always do an API lookup if we don't already have a harmonised
+    # sumstats URL — the OKG dataset_metadata.source_url usually points
+    # at the catalog study landing page (HTML), not the sumstats file.
     api_hit = None
-    if okg_hit is None or okg_hit.get("genome_build") is None \
-            or okg_hit.get("source_url") is None:
+    need_api = (
+        okg_hit is None
+        or okg_hit.get("genome_build") is None
+        or not _looks_like_sumstats_url(okg_hit.get("summary_statistics_url"))
+    )
+    if need_api:
         try:
             api_hit = catalog_api_lookup(args.gcst)
         except RuntimeError as e:
@@ -223,11 +285,13 @@ def main() -> int:
                 emit_coverage_stub(args.cache_dir, args.gcst, str(e))
                 sys.exit(f"REFUSED: {e}")
 
-    # Reconcile.
+    # Reconcile build + download URL.
     build = (okg_hit and okg_hit.get("genome_build")) \
         or (api_hit and api_hit.get("genome_build"))
-    url = (okg_hit and okg_hit.get("source_url")) \
-        or (api_hit and api_hit.get("harmonised_url"))
+    url = (api_hit and api_hit.get("harmonised_url")) \
+        or (okg_hit and _looks_like_sumstats_url(
+            okg_hit.get("summary_statistics_url"))
+            and okg_hit.get("summary_statistics_url"))
     if not build:
         reason = (f"Neither OKG nor GWAS Catalog REST API yielded a "
                   f"`genome_build` for {args.gcst}.")
