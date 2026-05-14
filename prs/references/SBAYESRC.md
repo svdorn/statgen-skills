@@ -47,6 +47,42 @@ R 4.0+ is required. The package builds native C++ code so a working
 toolchain is needed (Xcode CLT on macOS; gfortran for the underlying
 matrix routines).
 
+### macOS arm64 build fix (R 4.5 + Apple clang 14+)
+
+Two compile errors block a stock install:
+
+1. **`-Wc++11-narrowing` promoted to error** by clang 14 — fails on
+   `SBayesRC.cpp:157  uint32_t size[2] = {thinIter, m};` with
+   *non-constant-expression cannot be narrowed from int to uint32_t*.
+
+2. **BH (Boost) headers require C++17** — `std::is_null_pointer`,
+   `std::is_final`, `std::remove_cv_t` are unavailable under
+   `-std=gnu++11` which the package declares.
+
+Both are fixed by appending to `~/.R/Makevars`:
+
+```make
+CXX11FLAGS += -Wno-c++11-narrowing
+CXX14FLAGS += -Wno-c++11-narrowing
+CXX17FLAGS += -Wno-c++11-narrowing
+CXX11 = $(CXX17)
+CXX11STD = -std=gnu++17
+```
+
+This demotes the narrowing rule back to a warning and reroutes any
+`CXX11` request through the C++17 toolchain (safe because C++17 is a
+superset of C++11). After this patch the package installs cleanly:
+
+```r
+remotes::install_github("zhilizheng/SBayesRC", upgrade = "never")
+# * DONE (SBayesRC)
+library(SBayesRC)
+# version 0.2.6
+```
+
+The upstream fix would be a one-line `static_cast<uint32_t>(...)` in
+`SBayesRC.cpp` plus declaring `SystemRequirements: C++17` in `DESCRIPTION`.
+
 ## BaselineLD annotation file
 
 SBayesRC requires a functional-genomic annotation file (the BaselineLD

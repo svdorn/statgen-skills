@@ -58,14 +58,16 @@ log_line("SBayesRC version:",
           as.character(utils::packageVersion("SBayesRC")))
 
 # ----- Cache the BaselineLD annotation file -------------------------------
+# The zip at the GCTB host unpacks to a single ~2 GB TSV. SBayesRC's
+# `sbayesrc(annot = ...)` parameter wants that TSV path directly.
 annot_path <- args$`annot-cache`
-annot_url <- "https://gctbhub.cloud.edu.au/data/SBayesRC/resources/v2.0/Annotations/baselineLD_2.2.annot.txt.gz"
-if (!file.exists(annot_path)) {
-  log_line("downloading BaselineLD 2.2 annotation file...")
+annot_url <- "https://gctbhub.cloud.edu.au/data/SBayesRC/resources/v2.0/Annotation/annot_baseline2.2.zip"
+if (!file.exists(annot_path) || file.size(annot_path) < 1e8) {
+  log_line("downloading BaselineLD 2.2 annotation zip ->", annot_path)
   dir.create(dirname(annot_path), showWarnings = FALSE, recursive = TRUE)
-  utils::download.file(annot_url, destfile = paste0(annot_path, ".gz"),
-                       mode = "wb")
-  R.utils::gunzip(paste0(annot_path, ".gz"), destname = annot_path)
+  zip_path <- paste0(annot_path, ".zip")
+  utils::download.file(annot_url, destfile = zip_path, mode = "wb")
+  utils::unzip(zip_path, exdir = dirname(annot_path))
 }
 log_line("annotation file:", annot_path)
 
@@ -73,32 +75,34 @@ log_line("annotation file:", annot_path)
 out_prefix <- args$out
 dir.create(dirname(out_prefix), showWarnings = FALSE, recursive = TRUE)
 
-tidy_prefix <- paste0(out_prefix, ".tidy")
+# SBayesRC's tidy/impute write to <output> directly (no .ma suffix);
+# subsequent steps consume the same path that tidy wrote.
+tidy_path <- paste0(out_prefix, ".tidy")
 log_line("step 1/3: SBayesRC::tidy()")
 SBayesRC::tidy(
   mafile = args$cojo,
   LDdir = args$`ld-dir`,
-  output = tidy_prefix,
+  output = tidy_path,
   log2file = TRUE
 )
 
 # ----- Impute any missing SNPs from the LD reference ----------------------
-imputed_prefix <- paste0(out_prefix, ".imputed")
+imputed_path <- paste0(out_prefix, ".imputed")
 log_line("step 2/3: SBayesRC::impute()")
 SBayesRC::impute(
-  mafile = paste0(tidy_prefix, ".ma"),
+  mafile = tidy_path,
   LDdir = args$`ld-dir`,
-  output = imputed_prefix,
+  output = imputed_path,
   log2file = TRUE
 )
 
 # ----- Run the SBayesRC sampler -------------------------------------------
 log_line("step 3/3: SBayesRC::sbayesrc()")
 fit <- SBayesRC::sbayesrc(
-  mafile = paste0(imputed_prefix, ".ma"),
+  mafile = imputed_path,
   LDdir = args$`ld-dir`,
   annot = annot_path,
-  output = out_prefix,
+  outPrefix = out_prefix,
   log2file = TRUE
 )
 
