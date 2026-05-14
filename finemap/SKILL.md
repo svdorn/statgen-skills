@@ -1,6 +1,6 @@
 ---
 name: finemap
-description: Fine-mapping wrapper around the mancusolab/sushie Python package. Supports single-ancestry SuSiE and multi-ancestry SuShiE via either individual-level VCF+phenotype inputs (`susie`/`sushie` subcommands) or GWAS summary statistics + LD (`sumstats` subcommand, calls `infer_sushie_ss` directly). Auto-installs sushie from GitHub on first use and runs the bundled 3-ancestry tutorial as a verification step so users know their install works. Records OKG provenance (method:sushie or method:susie_finemapping, software:sushie, paper:sushie_2025) in a per-run .finemap.json sidecar when $OKG_REPO is set. Use when a user asks to fine-map a locus with SuSiE or to do multi-ancestry fine-mapping with SuShiE.
+description: Fine-mapping wrapper around the mancusolab/sushie Python package. Four modes: `susie` (single-ancestry, individual genotypes), `sushie` (multi-ancestry, individual genotypes), `region` (single-locus from GWAS sumstats + a reference VCF/PLINK; sushie computes LD internally), `sumstats` (precomputed Z + LD matrices, K=1 SuSiE-RSS or K≥2 SuShiE via `infer_sushie_ss`). Auto-installs sushie from GitHub on first use and runs the bundled 3-ancestry tutorial as a verification step. Records OKG provenance (method:sushie or method:susie_finemapping, software:sushie, paper:sushie_2025, plus ld_panel + dataset when supplied) in a per-run .finemap.json sidecar when $OKG_REPO is set. Use when a user asks to fine-map a locus with SuSiE or to do multi-ancestry fine-mapping with SuShiE.
 license: MIT
 compatibility: Requires Python 3.9+, git, and ~500 MB of disk for the sushie clone + tutorial data. Auto-installs sushie via `pip install .` (or `uv pip install`). OKG provenance optional, gated on $OKG_REPO.
 metadata:
@@ -18,11 +18,22 @@ Wraps the `sushie finemap` CLI behind a thin orchestrator that:
 
 1. **Installs sushie** on first use (clones `mancusolab/sushie` to `~/.cache/sushie/repo`, runs `pip install .`).
 2. **Verifies the install** by running the bundled 3-ancestry tutorial against `<repo>/data/`. Once-only; results recorded under `~/.cache/sushie/verify_install/`.
-3. **Runs fine-mapping** in one of three modes:
+3. **Runs fine-mapping** in one of four modes:
    - **`susie`**: single-population, individual-level (one VCF + one phenotype file).
    - **`sushie`**: multi-population, individual-level (K VCFs + K phenotype files).
-   - **`sumstats`**: GWAS sumstats + LD (K=1 SuSiE-RSS, K≥2 SuShiE) via `infer_sushie_ss`.
-4. **Records provenance** in a `.finemap.json` sidecar with sushie version (git SHA), bundled CLI flags, parsed CS / PIP summary, and OKG node IDs (method, software, paper).
+   - **`region`**: single-locus from GWAS sumstats + reference genotypes. Pass `--gwas-sumstats`, `--chrom/--start/--end`, `--N`, and one of `--ref-vcf` / `--ref-plink` / `--ref-bgen`; sushie computes the LD matrix internally. This is the simplest mode when you have a GWAS sumstats file and an ancestry-matched genotype reference panel (e.g. 1000G EUR).
+   - **`sumstats`**: precomputed Z-score files + precomputed LD matrices per ancestry (K=1 SuSiE-RSS, K≥2 SuShiE) via `infer_sushie_ss` — use when you've already computed LD yourself.
+4. **Records provenance** in a `.finemap.json` sidecar with sushie version (git SHA), bundled CLI flags, parsed CS / PIP summary, and OKG node IDs (method, software, paper, ld_panel, dataset where applicable).
+
+### Choosing between `region` and `sumstats`
+
+| You have… | Use `region` | Use `sumstats` |
+|---|---|---|
+| GWAS sumstats + reference VCF / PLINK / BGEN | ✓ (sushie computes LD) | requires precomputed LD |
+| Z-scores + precomputed LD `.npy` per locus | n/a | ✓ |
+| Multiple ancestries simultaneously (SuShiE) | not yet (use `sumstats`) | ✓ (pass K files per flag) |
+
+For LD-source options + how to get a 1000G EUR (hg19/hg38) reference VCF, see [references/LD_OPTIONS.md](references/LD_OPTIONS.md).
 
 ## First-run setup (verify-install)
 

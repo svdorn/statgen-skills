@@ -298,6 +298,204 @@ def _parse_outputs(out_prefix: Path) -> dict:
     return summary
 
 
+# ---------------------------- GWAS region mode (sumstats + ref VCF/PLINK) ----------------------------
+
+# sushie's `finemap --summary` mode reads a sumstats TSV with this exact
+# column order; we auto-convert from GWAS-Catalog harmonised or LDSC
+# munged input.
+SUSHIE_GWAS_HEADER = ["chrom", "snp", "pos", "a1", "a0", "z"]
+
+_NA_TOKENS = {"", "NA", "nan", "NaN", "N/A", ".", "null", "None"}
+
+
+def _open_text(path: Path):
+    import gzip
+    if str(path).endswith(".gz"):
+        return gzip.open(path, "rt")
+    return open(path, "rt")
+
+
+def detect_and_convert_to_sushie_gwas(input_path: Path,
+                                       chrom: int, start: int, end: int,
+                                       out_path: Path) -> int:
+    """Read a GWAS sumstats file (GWAS Catalog harmonised TSV, LDSC munged
+    `.sumstats.gz`, or any TSV with chrom/snp/pos/effect_allele/other_allele
+    + signed effect or z columns), filter to the (chrom, start, end) window,
+    and write a sushie-compatible TSV with header
+    `chrom snp pos a1 a0 z`.
+
+    Returns the number of rows written.
+    """
+    with _open_text(input_path) as f:
+        header = f.readline().rstrip("\n").split("\t")
+    cols = {c: i for i, c in enumerate(header)}
+    cols_l = {c.lower(): i for i, c in enumerate(header)}
+
+    def col(*candidates):
+        for c in candidates:
+            if c in cols:
+                return cols[c]
+            if c.lower() in cols_l:
+                return cols_l[c.lower()]
+        return None
+
+    # Prefer harmonised columns; alleles get uppercased on the way out.
+    chr_i = col("CHR", "chr", "chromosome", "hm_chrom")
+    pos_i = col("POS", "pos", "base_pair_location", "hm_pos", "bp")
+    snp_i = col("SNP", "snp", "hm_rsid", "rsid", "variant_id", "snpid")
+    a1_i  = col("A1", "a1", "hm_effect_allele", "effect_allele")
+    a0_i  = col("A2", "a0", "a2", "hm_other_allele", "other_allele")
+    beta_i = col("BETA", "beta", "hm_beta", "b")
+    se_i   = col("SE", "se", "standard_error", "stderr")
+    z_i    = col("Z", "z", "zscore")
+    or_i   = col("OR", "hm_odds_ratio", "odds_ratio")
+
+    missing = [name for name, idx in
+                [("chrom", chr_i), ("pos", pos_i), ("snp", snp_i),
+                 ("a1", a1_i), ("a0", a0_i)] if idx is None]
+    if missing:
+        sys.exit(f"REFUSED: input header missing required columns "
+                 f"{missing}; header was {header[:25]}")
+    has_signed = z_i is not None or (beta_i is not None and se_i is not None) \
+                  or (or_i is not None and se_i is not None)
+    if not has_signed:
+        sys.exit("REFUSED: cannot derive a signed effect from the input "
+                 "(need Z, or BETA+SE, or OR+SE)")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    n_written = 0
+    with _open_text(input_path) as f, open(out_path, "w") as g:
+        f.readline()  # skip header
+        g.write("\t".join(SUSHIE_GWAS_HEADER) + "\n")
+        for line in f:
+            r = line.rstrip("\n").split("\t")
+            if len(r) < max(i for i in (chr_i, pos_i, snp_i, a1_i, a0_i,
+                                          beta_i, se_i, z_i, or_i)
+                              if i is not None) + 1:
+                continue
+            # Normalise chrom to int; skip X/Y/MT (sushie only does 1-22).
+            chrom_s = str(r[chr_i]).lstrip("chr").strip()
+            if not chrom_s.isdigit():
+                continue
+            try:
+                pos_int = int(r[pos_i])
+            except ValueError:
+                continue
+            chrom_i = int(chrom_s)
+            if chrom_i != int(chrom) or pos_int < int(start) or pos_int > int(end):
+                continue
+            snp = r[snp_i]
+            a1 = r[a1_i].upper(); a0 = r[a0_i].upper()
+            if snp in _NA_TOKENS or a1 in _NA_TOKENS or a0 in _NA_TOKENS:
+                continue
+            # signed effect -> z
+            try:
+                if z_i is not None and r[z_i] not in _NA_TOKENS:
+                    z = float(r[z_i])
+                elif beta_i is not None and se_i is not None:
+                    b = float(r[beta_i]); se = float(r[se_i])
+                    if se == 0:
+                        continue
+                    z = b / se
+                elif or_i is not None and se_i is not None:
+                    import math
+                    b = math.log(float(r[or_i])); se = float(r[se_i])
+                    if se == 0:
+                        continue
+                    z = b / se
+                else:
+                    continue
+            except (ValueError, IndexError):
+                continue
+            g.write(f"{chrom_i}\t{snp}\t{pos_int}\t{a1}\t{a0}\t{z:.6g}\n")
+            n_written += 1
+    return n_written
+
+
+def run_region(args, repo_dir: Path) -> int:
+    """Single-locus fine-mapping with sushie's `finemap --summary`.
+    Sushie computes LD internally from --vcf / --plink / --bgen reference
+    genotypes (no precomputed LD matrix required)."""
+    sushie_gwas = Path(str(args.out) + ".gwas.tsv")
+    n = detect_and_convert_to_sushie_gwas(
+        args.gwas_sumstats, args.chrom, args.start, args.end, sushie_gwas)
+    print(f"[finemap region] converted GWAS -> {sushie_gwas} ({n} rows "
+          f"in chr{args.chrom}:{args.start}-{args.end})", file=sys.stderr)
+    if n < 50:
+        sys.exit(f"REFUSED: only {n} GWAS rows in the requested window; "
+                 f"need at least 50 SNPs to fine-map")
+
+    cli = which_sushie_cli().split()
+    cmd = cli + ["finemap",
+                  "--summary",
+                  "--gwas", str(sushie_gwas),
+                  "--gwas-header", *SUSHIE_GWAS_HEADER,
+                  "--sample-size", str(args.N),
+                  "--chrom", str(args.chrom),
+                  "--start", str(args.start),
+                  "--end", str(args.end),
+                  "--output", str(args.out)]
+    # LD source: either a reference genotype panel (sushie computes LD) or
+    # a precomputed LD matrix.
+    if args.ref_vcf:
+        cmd += ["--vcf", *[str(p) for p in args.ref_vcf]]
+    elif args.ref_plink:
+        cmd += ["--plink", *[str(p) for p in args.ref_plink]]
+    elif args.ref_bgen:
+        cmd += ["--bgen", *[str(p) for p in args.ref_bgen]]
+    elif args.ld:
+        cmd += ["--ld", *[str(p) for p in args.ld]]
+    else:
+        sys.exit("REFUSED: provide one of --ref-vcf / --ref-plink / "
+                 "--ref-bgen / --ld for the LD source")
+    if args.extra:
+        cmd += args.extra
+
+    print(f"[finemap region] {' '.join(cmd)}", file=sys.stderr)
+    rc = subprocess.call(cmd)
+
+    # OKG provenance (single-ancestry SuSiE-RSS path).
+    nids = list(OKG_NODES_SUSIE.values())
+    found = resolve_okg(args.okg_repo, nids)
+    okg_node_ids = {k: v for k, v in OKG_NODES_SUSIE.items() if v in found}
+    if args.okg_ld_panel_id:
+        okg_node_ids["ld_panel"] = args.okg_ld_panel_id
+    if args.okg_dataset_id:
+        okg_node_ids["dataset"] = args.okg_dataset_id
+
+    summary = _parse_outputs(args.out)
+    summary["n_snps_in_window"] = n
+    manifest = {
+        "subcommand": "region",
+        "output_prefix": str(args.out),
+        "sushie_repo": args.repo_url,
+        "sushie_commit": get_repo_commit(repo_dir),
+        "n_ancestries": 1,
+        "locus": {"chrom": int(args.chrom),
+                   "start": int(args.start),
+                   "end": int(args.end)},
+        "inputs": {
+            "gwas_sumstats": str(args.gwas_sumstats),
+            "ref_vcf":   [str(p) for p in (args.ref_vcf or [])],
+            "ref_plink": [str(p) for p in (args.ref_plink or [])],
+            "ref_bgen":  [str(p) for p in (args.ref_bgen or [])],
+            "ld":        [str(p) for p in (args.ld or [])],
+        },
+        "sample_size": args.N,
+        "summary": summary,
+        "okg_node_ids": okg_node_ids,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+    }
+    mpath = Path(f"{args.out}.finemap.json")
+    mpath.write_text(json.dumps(manifest, indent=2))
+    print(f"manifest -> {mpath}", file=sys.stderr)
+    if rc == 0 and summary:
+        print(f"summary: {summary.get('n_cs', '?')} CSs, "
+              f"mean size {summary.get('mean_cs_size', '?')}, "
+              f"max PIP {summary.get('max_pip', '?')}")
+    return rc
+
+
 # ---------------------------- Sumstats mode ----------------------------
 
 def _load_z(path: Path) -> tuple[list[str], list[float]]:
@@ -502,6 +700,56 @@ def main() -> int:
     psushie = sub.add_parser("sushie", help="Multi-ancestry fine-mapping")
     _add_common(psushie)
 
+    preg = sub.add_parser("region",
+                           help="Single-locus fine-mapping from GWAS sumstats "
+                                "+ a reference VCF/PLINK (sushie computes "
+                                "LD internally; no precomputed matrix needed)")
+    preg.add_argument("--gwas-sumstats", dest="gwas_sumstats", type=Path,
+                      required=True,
+                      help="GWAS sumstats file (GWAS Catalog harmonised "
+                           "TSV, LDSC munged .sumstats.gz, or any TSV "
+                           "with chrom/snp/pos/effect_allele/other_allele "
+                           "+ z or beta/se)")
+    preg.add_argument("--chrom", type=int, required=True, choices=range(1, 23),
+                      help="Chromosome (1-22)")
+    preg.add_argument("--start", type=int, required=True,
+                      help="Window start, bp")
+    preg.add_argument("--end", type=int, required=True,
+                      help="Window end, bp")
+    preg.add_argument("--N", type=int, required=True,
+                      help="GWAS total sample size for this trait")
+    preg.add_argument("--ref-vcf", dest="ref_vcf", type=Path, nargs="+",
+                      help="Reference genotype VCF (sushie computes LD "
+                           "from this; usually 1000G or UKB on a build "
+                           "matching the GWAS)")
+    preg.add_argument("--ref-plink", dest="ref_plink", type=Path, nargs="+",
+                      help="Reference genotype PLINK1.9 prefix(es) "
+                           "(alternative to --ref-vcf)")
+    preg.add_argument("--ref-bgen", dest="ref_bgen", type=Path, nargs="+",
+                      help="Reference genotype BGEN 1.3 file(s) "
+                           "(alternative to --ref-vcf)")
+    preg.add_argument("--ld", type=Path, nargs="+",
+                      help="Pre-computed LD matrix (tsv/tsv.gz) — bypasses "
+                           "the reference-genotype LD computation")
+    preg.add_argument("--out", type=Path, required=True,
+                      help="Output prefix")
+    preg.add_argument("--okg-dataset-id", dest="okg_dataset_id", type=str,
+                      help="OKG dataset_metadata node ID for the GWAS "
+                           "(recorded in the manifest's okg_node_ids)")
+    preg.add_argument("--okg-ld-panel-id", dest="okg_ld_panel_id", type=str,
+                      help="OKG ld_panel node ID for the reference "
+                           "genotypes (recorded in the manifest)")
+    preg.add_argument("--repo-url", type=str, default=DEFAULT_REPO)
+    preg.add_argument("--sushie-commit", dest="commit", type=str, default=None)
+    preg.add_argument("--repo-cache", type=Path, default=CACHE_ROOT)
+    preg.add_argument("--refresh", action="store_true")
+    preg.add_argument("--re-verify", action="store_true")
+    preg.add_argument("--okg-repo", type=Path,
+                      default=Path(os.environ["OKG_REPO"])
+                              if os.environ.get("OKG_REPO") else None)
+    preg.add_argument("extra", nargs=argparse.REMAINDER,
+                      help="Extra flags forwarded to `sushie finemap`")
+
     pss = sub.add_parser("sumstats",
                           help="Sumstats fine-mapping via infer_sushie_ss "
                                "(K=1 SuSiE-RSS or K>=2 SuShiE)")
@@ -543,7 +791,7 @@ def main() -> int:
         ensure_sushie_installed(repo_dir)
         return verify_install(repo_dir)
 
-    if args.subcmd not in ("susie", "sushie", "sumstats"):
+    if args.subcmd not in ("susie", "sushie", "sumstats", "region"):
         p.print_help(sys.stderr)
         return 2
 
@@ -563,6 +811,8 @@ def main() -> int:
 
     if args.subcmd == "sumstats":
         return run_sumstats(args, repo_dir)
+    if args.subcmd == "region":
+        return run_region(args, repo_dir)
 
     # Validate ancestry count vs subcommand.
     if args.subcmd == "susie" and len(args.vcf) != 1:
