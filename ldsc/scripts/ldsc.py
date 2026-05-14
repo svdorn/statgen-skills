@@ -249,6 +249,91 @@ def _strip_dashdash(extras: list) -> list:
     return [a for a in extras if a != "--"]
 
 
+def _mcp_call(okg_repo: Path, method: str, arguments: dict) -> Optional[dict]:
+    """Generic MCP tool call to the statgen-analysis server. Returns the
+    structuredContent dict from the response, or None on any failure."""
+    if not (okg_repo / "deployments/statgen-analysis/server.py").exists():
+        return None
+    env = os.environ.copy()
+    env.setdefault("OKG_DSN",
+                   "postgres://postgres:okg@localhost:5449/statgen_analysis")
+    proc = subprocess.Popen(
+        ["uv", "run", "--extra", "mcp", "python",
+         "deployments/statgen-analysis/server.py"],
+        cwd=str(okg_repo), env=env,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, text=True, bufsize=1,
+    )
+    def send(m): proc.stdin.write(json.dumps(m) + "\n"); proc.stdin.flush()
+    def read(): return json.loads(proc.stdout.readline())
+    try:
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                         "clientInfo": {"name": "ldsc-skill", "version": "0.1"}}})
+        read()
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+              "params": {"name": method, "arguments": arguments}})
+        resp = read()
+    except Exception:
+        return None
+    finally:
+        try: proc.stdin.close()
+        except Exception: pass
+        try: proc.wait(timeout=3)
+        except subprocess.TimeoutExpired: proc.terminate()
+    return resp.get("result", {}).get("structuredContent") or None
+
+
+def resolve_okg_dataset(okg_repo: Optional[Path],
+                         dataset_id: str) -> Optional[dict]:
+    """Return the OKG dataset_metadata node (node_id + attrs) or None."""
+    if okg_repo is None:
+        return None
+    sc = _mcp_call(okg_repo, "get_node", {"node_id": dataset_id})
+    if not sc or sc.get("node_id") != dataset_id:
+        return None
+    return {"node_id": dataset_id, "attrs": sc.get("attrs") or {}}
+
+
+def resolve_okg_dataset_trait_pop_prev(
+        okg_repo: Optional[Path], dataset_id: str) -> Optional[dict]:
+    """Follow dataset -references-> trait, return the trait's
+    {node_id, pop_prevalence, pop_prevalence_source} if present.
+
+    MCP list_neighbors returns items shaped like
+    {edge_id, src, dst, edge_type, attrs, direction} under a `neighbors`
+    key (no nested node object). We pick `dst` when direction='out'."""
+    if okg_repo is None:
+        return None
+    sc = _mcp_call(okg_repo, "list_neighbors",
+                    {"node_id": dataset_id, "direction": "out",
+                     "edge_type": "references"})
+    if not sc:
+        return None
+    neighbors = sc.get("neighbors") or sc.get("results") or []
+    for hit in neighbors:
+        # Direction='out' on a list_neighbors call → the neighbor is dst.
+        # Fall back to node_id / node.node_id for older shapes.
+        node = hit.get("node") if isinstance(hit, dict) and hit.get("node") else None
+        nid = (node.get("node_id") if node else None) or \
+               hit.get("dst") or hit.get("node_id")
+        if nid and nid.startswith("trait:"):
+            trait_sc = _mcp_call(okg_repo, "get_node", {"node_id": nid})
+            if trait_sc:
+                a = trait_sc.get("attrs") or {}
+                if a.get("pop_prevalence") is not None:
+                    try:
+                        pop = float(a["pop_prevalence"])
+                    except (TypeError, ValueError):
+                        continue
+                    return {"node_id": nid,
+                            "pop_prevalence": pop,
+                            "pop_prevalence_source":
+                                a.get("pop_prevalence_source")}
+    return None
+
+
 def resolve_okg_ld_panel(okg_repo: Optional[Path],
                           panel_id: str) -> Optional[dict]:
     """Query the OKG for an ld_panel node and return its attrs
@@ -465,22 +550,81 @@ def run_munge(args, repo_dir: Path, okg_node_ids: dict) -> int:
     return rc
 
 
+def resolve_liability_prevalences(args) -> tuple:
+    """Resolve (samp_prev, pop_prev) for liability-scale h^2.
+
+    Priority:
+      1. Explicit --samp-prev / --pop-prev flags from the user.
+      2. OKG dataset_metadata (when --okg-dataset-id given): samp_prev =
+         n_cases / (n_cases + n_controls); pop_prev = the trait's
+         attrs.pop_prevalence (resolved via the dataset's `references`
+         edge to a trait).
+
+    Returns (samp_prev, pop_prev, samp_src, pop_src) where the *_src
+    fields are short strings citing where the value came from.
+    Either or both can be None — liability conversion only runs when
+    BOTH are present.
+    """
+    samp_prev = getattr(args, "samp_prev", None)
+    pop_prev = getattr(args, "pop_prev", None)
+    samp_src = "flag" if samp_prev is not None else None
+    pop_src = "flag" if pop_prev is not None else None
+    dataset_id = getattr(args, "okg_dataset_id", None)
+    if (samp_prev is None or pop_prev is None) and dataset_id and args.okg_repo:
+        node = resolve_okg_dataset(args.okg_repo, dataset_id)
+        if node:
+            attrs = node.get("attrs") or {}
+            if samp_prev is None and attrs.get("n_cases") is not None and attrs.get("n_controls") is not None:
+                nc, nk = float(attrs["n_cases"]), float(attrs["n_controls"])
+                if nc > 0 and nk > 0:
+                    samp_prev = nc / (nc + nk)
+                    samp_src = f"computed from {dataset_id}.attrs.n_cases / total"
+            if pop_prev is None:
+                # Follow `references` edges from the dataset to its trait.
+                trait = resolve_okg_dataset_trait_pop_prev(args.okg_repo,
+                                                            dataset_id)
+                if trait and trait.get("pop_prevalence") is not None:
+                    pop_prev = float(trait["pop_prevalence"])
+                    pop_src = (f"resolved from {trait['node_id']}."
+                                f"attrs.pop_prevalence "
+                                f"(cited: {trait.get('pop_prevalence_source')})")
+    return samp_prev, pop_prev, samp_src, pop_src
+
+
 def run_h2(args, repo_dir: Path, ld_scores_dir: Path, ld_sha: str,
            okg_node_ids: dict) -> int:
+    samp_prev, pop_prev, samp_src, pop_src = resolve_liability_prevalences(args)
     cmd = [sys.executable, str(repo_dir / "ldsc.py"),
            "--h2", str(args.input),
            "--ref-ld-chr", str(ld_scores_dir) + "/",
            "--w-ld-chr", str(ld_scores_dir) + "/",
            "--out", str(args.out)]
+    liability_active = samp_prev is not None and pop_prev is not None
+    if liability_active:
+        cmd.extend(["--samp-prev", str(samp_prev),
+                    "--pop-prev", str(pop_prev)])
+        print(f"[ldsc h2] liability conversion enabled: "
+              f"samp_prev={samp_prev:.4g} ({samp_src}), "
+              f"pop_prev={pop_prev:.4g} ({pop_src})", file=sys.stderr)
+    elif samp_prev is not None or pop_prev is not None:
+        print(f"[ldsc h2] warning: have only one of samp_prev/pop_prev "
+              f"(samp={samp_prev}, pop={pop_prev}); liability conversion "
+              f"requires both. Reporting observed-scale h^2 only.",
+              file=sys.stderr)
     if args.extra:
         cmd.extend(_strip_dashdash(args.extra))
     print(f"[ldsc h2] {' '.join(cmd)}", file=sys.stderr)
     rc = subprocess.call(cmd)
     log = Path(str(args.out) + ".log")
     summary = _parse_h2_log(log) if log.exists() else {}
-    _write_manifest(args.out, "h2", args, repo_dir,
-                     {"ld_scores_dir": str(ld_scores_dir),
-                      "ld_scores_sha256": ld_sha},
+    extra_ld_info = {"ld_scores_dir": str(ld_scores_dir),
+                      "ld_scores_sha256": ld_sha}
+    if liability_active:
+        extra_ld_info["liability"] = {
+            "samp_prev": samp_prev, "samp_prev_source": samp_src,
+            "pop_prev": pop_prev, "pop_prev_source": pop_src,
+        }
+    _write_manifest(args.out, "h2", args, repo_dir, extra_ld_info,
                      summary, okg_node_ids)
     return rc
 
@@ -529,6 +673,10 @@ def _parse_h2_log(log: Path) -> dict:
     m = re.search(r"Total Observed scale h2:\s+([-\d.eE+]+)\s+\(([-\d.eE+]+)\)", text)
     if m:
         summary["h2"] = float(m.group(1)); summary["h2_se"] = float(m.group(2))
+    m = re.search(r"Total Liability scale h2:\s+([-\d.eE+]+)\s+\(([-\d.eE+]+)\)", text)
+    if m:
+        summary["h2_liability"] = float(m.group(1))
+        summary["h2_liability_se"] = float(m.group(2))
     m = re.search(r"Intercept:\s+([-\d.eE+]+)\s+\(([-\d.eE+]+)\)", text)
     if m:
         summary["intercept"] = float(m.group(1))
@@ -648,6 +796,20 @@ def main() -> int:
     ph.add_argument("--in", dest="input", type=Path, required=True,
                     help="Munged sumstats (.sumstats.gz)")
     ph.add_argument("--out", type=Path, required=True)
+    ph.add_argument("--samp-prev", dest="samp_prev", type=float, default=None,
+                    help="Sample case fraction for liability-scale h^2. "
+                         "Auto-resolved from --okg-dataset-id (n_cases / "
+                         "(n_cases + n_controls)) when omitted.")
+    ph.add_argument("--pop-prev", dest="pop_prev", type=float, default=None,
+                    help="Population prevalence for liability-scale h^2. "
+                         "Auto-resolved from the dataset's trait via "
+                         "`references` edge -> trait.attrs.pop_prevalence "
+                         "when omitted.")
+    ph.add_argument("--okg-dataset-id", dest="okg_dataset_id", type=str,
+                    default=None,
+                    help="OKG dataset_metadata node ID; lets the skill "
+                         "auto-resolve --samp-prev / --pop-prev from the "
+                         "graph. Recorded in the manifest.")
     _add_common(ph)
 
     prg = sub.add_parser("rg", help="Estimate genetic correlation")
