@@ -86,6 +86,7 @@ For `sumstats` (GWAS sumstats + LD; K=1 SuSiE-RSS, K≥2 SuShiE):
    - Output prefix and files generated (`<out>.cs.tsv`, `<out>.weight.tsv`, `<out>.cv.tsv`, `<out>.log`)
    - Number of credible sets, mean CS size, top-PIP variant per CS
    - For `sushie`: the estimated cross-ancestry effect-size correlation matrix from `<out>.corr.tsv`
+   - For `region`: a printed **rsID-enriched credible-set table** (CS index, PIP, rsID, chr:pos, effect/non-effect alleles, β, SE, p) — joined from sushie's chr:pos-keyed CS output back to the original GWAS sumstats via the `<out>.gwas_extras.tsv` sidecar the orchestrator writes during the COJO-style conversion. One row per CS member, sorted by CS then descending PIP within CS. Markdown format so it's directly pasteable into reports / chat.
    - Path to `.finemap.json` sidecar with full provenance
 
 ## Examples

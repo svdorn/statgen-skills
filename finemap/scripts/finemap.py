@@ -624,7 +624,9 @@ def _open_text(path: Path):
 
 def detect_and_convert_to_sushie_gwas(input_path: Path,
                                        chrom: int, start: int, end: int,
-                                       out_path: Path) -> int:
+                                       out_path: Path,
+                                       extras_path: Optional[Path] = None
+                                       ) -> int:
     """Read a GWAS sumstats file (GWAS Catalog harmonised TSV, LDSC munged
     `.sumstats.gz`, or any TSV with chrom/snp/pos/effect_allele/other_allele
     + signed effect or z columns), filter to the (chrom, start, end) window,
@@ -656,6 +658,7 @@ def detect_and_convert_to_sushie_gwas(input_path: Path,
     se_i   = col("SE", "se", "standard_error", "stderr")
     z_i    = col("Z", "z", "zscore")
     or_i   = col("OR", "hm_odds_ratio", "odds_ratio")
+    p_i    = col("P", "p", "p_value", "pval", "Pvalue", "PValue")
 
     missing = [name for name, idx in
                 [("chrom", chr_i), ("pos", pos_i), ("snp", snp_i),
@@ -671,6 +674,15 @@ def detect_and_convert_to_sushie_gwas(input_path: Path,
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     n_written = 0
+    # Sidecar `<out>.gwas_extras.tsv` carries the per-SNP rsid + beta + se
+    # + p mapped by chr:pos, so the post-run CS table can join back to
+    # rsids and effect-size details (sushie's CS output uses chr:pos as
+    # the SNP id and doesn't preserve rsids).
+    extras_handle = None
+    if extras_path is not None:
+        extras_path.parent.mkdir(parents=True, exist_ok=True)
+        extras_handle = open(extras_path, "w")
+        extras_handle.write("chrpos\trsid\tbeta\tse\tp\n")
     with _open_text(input_path) as f, open(out_path, "w") as g:
         f.readline()  # skip header
         g.write("\t".join(SUSHIE_GWAS_HEADER) + "\n")
@@ -722,7 +734,32 @@ def detect_and_convert_to_sushie_gwas(input_path: Path,
             # internal logic then handles allele alignment.
             snp_id = f"{chrom_i}:{pos_int}"
             g.write(f"{chrom_i}\t{snp_id}\t{pos_int}\t{a1}\t{a0}\t{z:.6g}\n")
+            if extras_handle is not None:
+                # Capture beta + se + p if present, else NA — used by the
+                # post-run summary table to reconstruct effect-size detail.
+                def _safe(idx):
+                    if idx is None:
+                        return "NA"
+                    try:
+                        v = r[idx]
+                        return v if v not in _NA_TOKENS else "NA"
+                    except IndexError:
+                        return "NA"
+                p_str = _safe(p_i)
+                if beta_i is not None and se_i is not None:
+                    b_str = _safe(beta_i); se_str = _safe(se_i)
+                elif or_i is not None and se_i is not None:
+                    try:
+                        b_str = f"{math.log(float(r[or_i])):.6g}"
+                    except (ValueError, IndexError):
+                        b_str = "NA"
+                    se_str = _safe(se_i)
+                else:
+                    b_str = "NA"; se_str = _safe(se_i)
+                extras_handle.write(f"{snp_id}\t{snp}\t{b_str}\t{se_str}\t{p_str}\n")
             n_written += 1
+    if extras_handle is not None:
+        extras_handle.close()
     return n_written
 
 
@@ -732,8 +769,10 @@ def run_region(args, repo_dir: Path,
     Sushie computes LD internally from --vcf / --plink / --bgen reference
     genotypes (no precomputed LD matrix required)."""
     sushie_gwas = Path(str(args.out) + ".gwas.tsv")
+    extras_sidecar = Path(str(args.out) + ".gwas_extras.tsv")
     n = detect_and_convert_to_sushie_gwas(
-        args.gwas_sumstats, args.chrom, args.start, args.end, sushie_gwas)
+        args.gwas_sumstats, args.chrom, args.start, args.end, sushie_gwas,
+        extras_path=extras_sidecar)
     print(f"[finemap region] converted GWAS -> {sushie_gwas} ({n} rows "
           f"in chr{args.chrom}:{args.start}-{args.end})", file=sys.stderr)
     if n < 50:
@@ -820,7 +859,71 @@ def run_region(args, repo_dir: Path,
         print(f"summary: {summary.get('n_cs', '?')} CSs, "
               f"mean size {summary.get('mean_cs_size', '?')}, "
               f"max PIP {summary.get('max_pip', '?')}")
+        # Print the rsID-enriched credible-set table.
+        _print_cs_summary_table(Path(args.out), extras_sidecar)
     return rc
+
+
+def _print_cs_summary_table(out_prefix: Path,
+                             extras_sidecar: Path) -> None:
+    """Print a human-readable rsID-enriched credible-set table to stdout.
+
+    Reads sushie's `<prefix>.sushie.cs.tsv` (which carries CSIndex, snp,
+    pos, a0, a1, pip_all) and joins by chr:pos with the `<prefix>.
+    gwas_extras.tsv` sidecar (chrpos, rsid, beta, se, p) the converter
+    wrote. Output: one row per CS member, sorted by CS index then by
+    descending pip_all within each CS."""
+    cs_path = _find_sushie_output(out_prefix, "cs.tsv")
+    if cs_path is None or not extras_sidecar.exists():
+        return
+    extras = {}
+    with open(extras_sidecar) as f:
+        header = f.readline().rstrip("\n").split("\t")
+        idx_chrpos = header.index("chrpos")
+        idx_rsid = header.index("rsid")
+        idx_beta = header.index("beta")
+        idx_se = header.index("se")
+        idx_p = header.index("p")
+        for line in f:
+            r = line.rstrip("\n").split("\t")
+            extras[r[idx_chrpos]] = (r[idx_rsid], r[idx_beta], r[idx_se],
+                                       r[idx_p])
+    rows = []
+    with open(cs_path) as f:
+        header = f.readline().rstrip("\n").split("\t")
+        try:
+            i_cs = header.index("CSIndex")
+            i_snp = header.index("snp")
+            i_pos = header.index("pos")
+            i_a0 = header.index("a0")
+            i_a1 = header.index("a1")
+            i_pip = header.index("pip_all")
+        except ValueError:
+            return
+        for line in f:
+            r = line.rstrip("\n").split("\t")
+            cs = int(r[i_cs])
+            try:
+                pip = float(r[i_pip])
+            except ValueError:
+                pip = 0.0
+            chrpos = r[i_snp]
+            ex = extras.get(chrpos, ("NA", "NA", "NA", "NA"))
+            rows.append((cs, -pip, chrpos, r[i_pos], r[i_a0], r[i_a1],
+                          pip, *ex))
+    if not rows:
+        return
+    rows.sort(key=lambda x: (x[0], x[1]))
+    # Render markdown-style table.
+    print()
+    print("Credible-set members (sorted by CS, descending PIP within CS):")
+    print()
+    print("| CS | PIP | rsID | chr:pos | Eff | NonEff | Beta | SE | P |")
+    print("|---|---|---|---|---|---|---|---|---|")
+    for cs, _, chrpos, pos, a0, a1, pip, rsid, beta, se, p in rows:
+        print(f"| {cs} | {pip:.4f} | {rsid} | {chrpos} | "
+              f"{a1} | {a0} | {beta} | {se} | {p} |")
+    print()
 
 
 # ---------------------------- Sumstats mode ----------------------------
