@@ -26,6 +26,7 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -72,27 +73,92 @@ def ensure_repo(repo_url: str, commit: Optional[str], cache_root: Path,
     return repo_dir
 
 
-def ensure_sushie_installed(repo_dir: Path) -> None:
-    try:
-        import sushie  # noqa: F401
-        return
-    except ImportError:
-        pass
-    for cmd in [
-        ["uv", "pip", "install", str(repo_dir)],
-        [sys.executable, "-m", "pip", "install", "--user", str(repo_dir)],
-        [sys.executable, "-m", "pip", "install", str(repo_dir)],
-    ]:
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True)
-            if r.returncode == 0:
-                print(f"installed sushie via: {' '.join(cmd[:3])}",
+def ensure_sushie_installed(repo_dir: Path) -> Path:
+    """Install sushie into an isolated `uv` venv when the host Python is
+    incompatible with sushie's pinned deps. Returns the python binary to
+    invoke (which `--vcf`/`--gwas`/etc. will then be passed to via
+    `python -m sushie`). Reuses the venv on subsequent runs.
+
+    sushie pins glimix_core==3.1.13 which is Python 3.7-3.10 only. On
+    Python 3.11+ host we can't install into the host env directly, so
+    we use uv to spin up a Python 3.10 venv keyed to the sushie cache.
+    """
+    venv_dir = repo_dir.parent / "venv-py310"
+    venv_py = venv_dir / "bin" / "python"
+    if venv_py.exists():
+        # Confirm sushie loads.
+        r = subprocess.run([str(venv_py), "-c", "import sushie"],
+                            capture_output=True, text=True)
+        if r.returncode == 0:
+            return venv_py
+
+    if not shutil.which("uv"):
+        sys.exit("ERROR: `uv` is required to install sushie into a "
+                 "Python 3.10 venv (sushie's deps don't support 3.11+). "
+                 "Install with `brew install uv` or "
+                 "`pipx install uv`.")
+    print(f"[sushie] creating Python 3.10 venv at {venv_dir} ...",
+          file=sys.stderr)
+    r = subprocess.run(["uv", "venv", "--python", "3.10", str(venv_dir)],
+                        capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"ERROR: uv venv creation failed: {r.stderr}")
+    print(f"[sushie] installing from {repo_dir} into {venv_dir} ...",
+          file=sys.stderr)
+    r = subprocess.run(["uv", "pip", "install", "--python", str(venv_py),
+                         str(repo_dir)],
+                        capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"ERROR: uv pip install of sushie failed:\n{r.stderr}")
+
+    # cyvcf2 ships a prebuilt macOS wheel linked against an older htslib;
+    # on hosts where the local htslib differs we hit
+    # `symbol not found in flat namespace '_bcf_float_missing'`. Force a
+    # source rebuild of cyvcf2 against the local htslib install
+    # (homebrew/conda) so the dynamic symbols match.
+    r = subprocess.run(
+        [str(venv_py), "-c",
+         "from cyvcf2 import VCF"],
+        capture_output=True, text=True)
+    if r.returncode != 0 and "bcf_float_missing" in r.stderr:
+        print("[sushie] cyvcf2 dylib mismatch detected; rebuilding from "
+              "source against local htslib ...", file=sys.stderr)
+        # cyvcf2's source build calls `autoreconf -i`; ensure it's there.
+        if not shutil.which("autoreconf"):
+            if sys.platform == "darwin" and shutil.which("brew"):
+                print("[sushie] installing autoconf/automake/libtool ...",
                       file=sys.stderr)
-                return
-        except FileNotFoundError:
-            continue
-    sys.exit("ERROR: could not pip-install sushie from "
-             f"{repo_dir}; try `pip install {repo_dir}` manually")
+                subprocess.run(["brew", "install", "autoconf", "automake",
+                                  "libtool"], capture_output=True, text=True)
+            elif shutil.which("apt-get"):
+                subprocess.run(["sudo", "apt-get", "install", "-y",
+                                  "autoconf", "automake", "libtool"],
+                                capture_output=True, text=True)
+        env = os.environ.copy()
+        # Homebrew prefix on Apple Silicon vs Intel macs.
+        prefix = "/opt/homebrew" if Path("/opt/homebrew").exists() \
+            else "/usr/local"
+        # cyvcf2 1.x ships its own htslib by default; tell it to use the
+        # system install (homebrew or conda) instead so the linked
+        # symbols match the dylib actually on the host.
+        env["CYVCF2_HTSLIB_MODE"] = "EXTERNAL"
+        env["HTSLIB_LIBRARY_DIR"] = f"{prefix}/lib"
+        env["HTSLIB_INCLUDE_DIR"] = f"{prefix}/include"
+        env["CFLAGS"] = (env.get("CFLAGS", "") +
+                          f" -I{prefix}/include").strip()
+        env["LDFLAGS"] = (env.get("LDFLAGS", "") +
+                           f" -L{prefix}/lib").strip()
+        # Sushie pins pandas==1.5.0 which doesn't support numpy>=2.0
+        # ('numpy.dtype size changed' ABI break). Pin numpy<2 in the
+        # cyvcf2 rebuild so the venv's pandas keeps working.
+        r2 = subprocess.run(
+            ["uv", "pip", "install", "--python", str(venv_py),
+             "--force-reinstall", "--no-binary", "cyvcf2",
+             "numpy<2", "cyvcf2"],
+            capture_output=True, text=True, env=env)
+        if r2.returncode != 0:
+            sys.exit(f"ERROR: cyvcf2 source rebuild failed:\n{r2.stderr}")
+    return venv_py
 
 
 def get_repo_commit(repo_dir: Path) -> str:
@@ -101,16 +167,26 @@ def get_repo_commit(repo_dir: Path) -> str:
     return r.stdout.strip()
 
 
-def which_sushie_cli() -> str:
-    """Return the path to the sushie CLI, prefer `sushie` on PATH else
-    `python -m sushie` as fallback."""
+def which_sushie_cli(venv_py: Optional[Path] = None) -> str:
+    """Return the command (as a space-separated string for shell-equivalent
+    invocation, split before subprocess.call) that launches sushie.
+
+    Prefers (1) the `sushie` console-script in the venv's bin/ directory
+    when an isolated venv was created, (2) a `sushie` on PATH, (3) the
+    host `python -m sushie` as last resort (rarely works since sushie
+    doesn't ship a __main__).
+    """
+    if venv_py is not None:
+        venv_sushie = venv_py.parent / "sushie"
+        if venv_sushie.exists():
+            return str(venv_sushie)
     p = shutil.which("sushie")
     return p if p else f"{sys.executable} -m sushie"
 
 
 # ---------------------------- Verify install ----------------------------
 
-def verify_install(repo_dir: Path) -> int:
+def verify_install(repo_dir: Path, venv_py: Optional[Path] = None) -> int:
     """Run the bundled 3-ancestry tutorial to verify the install works."""
     sentinel = CACHE_ROOT / "verify_install" / ".verified"
     data_dir = repo_dir / "data"
@@ -119,7 +195,7 @@ def verify_install(repo_dir: Path) -> int:
     out_prefix = out_dir / "test_result"
     if not data_dir.exists():
         sys.exit(f"ERROR: bundled tutorial data not found at {data_dir}")
-    cli = which_sushie_cli()
+    cli = which_sushie_cli(venv_py)
     cmd = (cli.split() + [
         "finemap",
         "--pheno", "EUR.pheno", "AFR.pheno", "EAS.pheno",
@@ -199,10 +275,11 @@ def resolve_okg(okg_repo: Optional[Path], node_ids: list[str]) -> dict:
 
 # ---------------------------- Run sushie ----------------------------
 
-def run_finemap(args, mode: str, repo_dir: Path) -> int:
+def run_finemap(args, mode: str, repo_dir: Path,
+                 venv_py: Optional[Path] = None) -> int:
     """Invoke `sushie finemap` with the user's flags. Mode is 'susie' or
     'sushie' — chosen by number of VCF args."""
-    cli = which_sushie_cli().split()
+    cli = which_sushie_cli(venv_py).split()
     cmd = cli + ["finemap",
                  "--vcf", *[str(p) for p in args.vcf],
                  "--pheno", *[str(p) for p in args.pheno],
@@ -253,10 +330,26 @@ def run_finemap(args, mode: str, repo_dir: Path) -> int:
     return rc
 
 
+def _find_sushie_output(out_prefix: Path, suffix: str) -> Optional[Path]:
+    """Sushie writes `<out_prefix>.sushie.<suffix>` (e.g. .sushie.cs.tsv)
+    for the `region` subcommand and `<out_prefix>.<suffix>` for the
+    individual-level tutorial path. Return the existing path, or None.
+    """
+    for candidate in (Path(f"{out_prefix}.sushie.{suffix}"),
+                       Path(f"{out_prefix}.{suffix}")):
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _parse_outputs(out_prefix: Path) -> dict:
+    """Parse sushie's per-CS + weights tables. Handles both naming
+    conventions: the `region` subcommand produces `<prefix>.sushie.cs.tsv`
+    + `<prefix>.sushie.weights.tsv`; the individual-level tutorial
+    produces `<prefix>.cs.tsv` + `<prefix>.weight.tsv`."""
     summary: dict = {}
-    cs_path = Path(f"{out_prefix}.cs.tsv")
-    if cs_path.exists():
+    cs_path = _find_sushie_output(out_prefix, "cs.tsv")
+    if cs_path is not None:
         try:
             with open(cs_path) as f:
                 header = f.readline().rstrip("\n").split("\t")
@@ -271,14 +364,32 @@ def _parse_outputs(out_prefix: Path) -> dict:
                     sizes = [len(v) for v in cs_groups.values()]
                     summary["mean_cs_size"] = round(sum(sizes) / len(sizes), 2)
                     summary["cs_sizes"] = sorted(sizes)
+            if rows and "pip_all" in header:
+                pip_idx = header.index("pip_all")
+                pips = []
+                for r in rows:
+                    try:
+                        pips.append(float(r[pip_idx]))
+                    except (ValueError, IndexError):
+                        continue
+                if pips:
+                    summary["max_pip"] = round(max(pips), 4)
         except Exception as e:
             summary["cs_parse_error"] = str(e)
-    weight_path = Path(f"{out_prefix}.weight.tsv")
-    if weight_path.exists():
+    weight_path = _find_sushie_output(out_prefix, "weights.tsv") or \
+                   _find_sushie_output(out_prefix, "weight.tsv")
+    if weight_path is not None:
         try:
             with open(weight_path) as f:
                 header = f.readline().rstrip("\n").split("\t")
-                pip_idx = header.index("PIP") if "PIP" in header else None
+                # The region subcommand uses `sushie_pip_all`; the
+                # tutorial uses `PIP`. Prefer whichever exists.
+                for pip_name in ("sushie_pip_all", "PIP", "pip_all"):
+                    if pip_name in header:
+                        pip_idx = header.index(pip_name)
+                        break
+                else:
+                    pip_idx = None
                 if pip_idx is not None:
                     max_pip = 0.0
                     for line in f:
@@ -292,10 +403,206 @@ def _parse_outputs(out_prefix: Path) -> dict:
                     summary["max_pip"] = round(max_pip, 4)
         except Exception as e:
             summary["weight_parse_error"] = str(e)
-    corr_path = Path(f"{out_prefix}.corr.tsv")
-    if corr_path.exists():
+    corr_path = _find_sushie_output(out_prefix, "corr.tsv")
+    if corr_path is not None:
         summary["cross_ancestry_correlation_file"] = str(corr_path)
     return summary
+
+
+# ---------------------------- htslib tool install + tabix slicing ----------------------------
+
+_HTSLIB_BINS = ("tabix", "bgzip", "bcftools")
+_FINEMAP_REFCACHE = Path.home() / ".cache" / "finemap"
+
+# Per-chromosome 1000G phase3 VCF URL pattern (build hg19).
+_1000G_HG19_URL = ("https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/"
+                    "20130502/ALL.chr{chrom}.phase3_shapeit2_mvncall_"
+                    "integrated_v5b.20130502.genotypes.vcf.gz")
+# Build GRCh38 NYGC re-call:
+_1000G_HG38_URL = ("https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/"
+                    "data_collections/1000_genomes_project/release/"
+                    "20190312_biallelic_SNV_and_INDEL/"
+                    "ALL.chr{chrom}.shapeit2_integrated_snvindels_v2a_"
+                    "27022019.GRCh38.phased.vcf.gz")
+# Sample → population integrated panel file.
+_1000G_PANEL_URL = ("https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/"
+                     "20130502/integrated_call_samples_v3.20130502."
+                     "ALL.panel")
+
+_POP_TO_SUPERPOP = {
+    "eur": "EUR", "eas": "EAS", "afr": "AFR", "sas": "SAS", "amr": "AMR",
+}
+
+
+def ensure_htslib_tools() -> dict:
+    """Make sure `tabix`, `bgzip`, `bcftools` are on PATH. If missing, try
+    a platform-appropriate install (brew on macOS, apt on Debian/Ubuntu,
+    conda if no system path works). Returns {bin: path} or sys.exits.
+    """
+    paths = {b: shutil.which(b) for b in _HTSLIB_BINS}
+    missing = [b for b, p in paths.items() if not p]
+    if not missing:
+        return paths
+
+    print(f"[finemap] installing missing htslib tools {missing} ...",
+          file=sys.stderr)
+    # Install htslib/bcftools + autoconf/automake/libtool — the latter
+    # three are needed when cyvcf2 has to rebuild from source against
+    # the local htslib (its CMake calls `autoreconf -i`).
+    installers = []
+    if sys.platform == "darwin" and shutil.which("brew"):
+        installers.append(["brew", "install", "htslib", "bcftools",
+                            "autoconf", "automake", "libtool"])
+    if shutil.which("apt-get"):
+        installers.append(["sudo", "apt-get", "install", "-y",
+                            "tabix", "bcftools", "autoconf", "automake",
+                            "libtool"])
+    if shutil.which("conda"):
+        installers.append(["conda", "install", "-y", "-c", "bioconda",
+                            "htslib", "bcftools"])
+    if shutil.which("mamba"):
+        installers.append(["mamba", "install", "-y", "-c", "bioconda",
+                            "htslib", "bcftools"])
+
+    for cmd in installers:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode == 0:
+                print(f"[finemap] installed via: {' '.join(cmd[:3])}",
+                      file=sys.stderr)
+                break
+        except FileNotFoundError:
+            continue
+
+    paths = {b: shutil.which(b) for b in _HTSLIB_BINS}
+    still_missing = [b for b, p in paths.items() if not p]
+    if still_missing:
+        sys.exit(f"ERROR: could not install {still_missing}. Install "
+                 f"manually: `brew install htslib bcftools` (macOS) / "
+                 f"`apt-get install tabix bcftools` (Debian) / "
+                 f"`conda install -c bioconda htslib bcftools`.")
+    return paths
+
+
+def _fetch_1000g_panel(cache_root: Path) -> Path:
+    """Cache the 1000G integrated panel file (sample → population)."""
+    p = cache_root / "1000g_integrated_panel.tsv"
+    if p.exists() and p.stat().st_size > 0:
+        return p
+    p.parent.mkdir(parents=True, exist_ok=True)
+    print(f"[finemap] downloading 1000G integrated panel -> {p}",
+          file=sys.stderr)
+    urllib.request.urlretrieve(_1000G_PANEL_URL, p)
+    return p
+
+
+def _samples_for_superpop(panel_file: Path, superpop: str) -> list[str]:
+    """Return the list of 1000G sample IDs in a given super-population."""
+    samples = []
+    with open(panel_file) as f:
+        header = f.readline().rstrip("\n").split()
+        try:
+            i_sample = header.index("sample")
+            i_super = header.index("super_pop")
+        except ValueError:
+            return []
+        for line in f:
+            r = line.rstrip("\n").split()
+            if len(r) > i_super and r[i_super] == superpop:
+                samples.append(r[i_sample])
+    return samples
+
+
+def ensure_1000g_slice(chrom: int, start: int, end: int,
+                        population: str, build: str = "hg19",
+                        cache_root: Path = _FINEMAP_REFCACHE) -> Path:
+    """Tabix-slice the 1000G phase3 VCF to (chrom:start-end), subset to a
+    super-population, bgzip+index, and cache. Returns the local cached path.
+
+    Args:
+        chrom: 1-22 (numeric)
+        start, end: bp coordinates on `build`
+        population: eur, eas, afr, sas, amr (case-insensitive)
+        build: hg19 (default) or hg38
+
+    Reuses the cached file when present. Total fetch on first run is
+    typically a few MB for a 1 Mb window.
+    """
+    pop = population.lower()
+    superpop = _POP_TO_SUPERPOP.get(pop)
+    if not superpop:
+        sys.exit(f"REFUSED: unknown population {population!r}; "
+                 f"allowed: {list(_POP_TO_SUPERPOP)}")
+    if build not in ("hg19", "hg38"):
+        sys.exit(f"REFUSED: unknown build {build!r}; allowed: hg19, hg38")
+
+    ensure_htslib_tools()
+    cache_root = cache_root / f"1000g_{build}_{pop}"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    out_vcf = cache_root / f"chr{chrom}_{start}_{end}.vcf.gz"
+    if out_vcf.exists() and out_vcf.stat().st_size > 0:
+        idx = Path(str(out_vcf) + ".tbi")
+        if idx.exists():
+            return out_vcf
+
+    url_template = _1000G_HG19_URL if build == "hg19" else _1000G_HG38_URL
+    url = url_template.format(chrom=chrom)
+    region = f"{chrom}:{start}-{end}"
+
+    # 1) Cache the sample → population panel.
+    panel = _fetch_1000g_panel(_FINEMAP_REFCACHE)
+    samples = _samples_for_superpop(panel, superpop)
+    if not samples:
+        sys.exit(f"REFUSED: no {superpop} samples found in 1000G panel "
+                 f"at {panel}")
+    keep_file = cache_root / f"{pop}.samples.txt"
+    keep_file.write_text("\n".join(samples) + "\n")
+
+    # 2) tabix-slice the remote VCF to the window, pipe into bcftools to
+    # subset samples, write bgzipped output, then tabix-index.
+    print(f"[finemap] tabix-slicing {url} @ {region} ({len(samples)} "
+          f"{superpop} samples) -> {out_vcf}", file=sys.stderr)
+    tmp_raw = cache_root / f"chr{chrom}_{start}_{end}.raw.vcf.gz"
+    # Stream tabix output through bgzip directly so we never materialise the
+    # full-population intermediate as plain VCF.
+    with open(tmp_raw, "wb") as out:
+        p_tab = subprocess.Popen(["tabix", "-h", url, region],
+                                  stdout=subprocess.PIPE)
+        p_bz = subprocess.Popen(["bgzip", "-c"],
+                                 stdin=p_tab.stdout, stdout=out)
+        p_tab.stdout.close()
+        p_bz.communicate()
+        p_tab.wait()
+        if p_tab.returncode != 0 or p_bz.returncode != 0:
+            sys.exit(f"ERROR: tabix/bgzip pipe failed for {region} from "
+                     f"{url}")
+    # bcftools view -S to subset samples + annotate ID = chr:pos. The
+    # GWAS converter writes IDs in the same `chr:pos` form, so the join
+    # is position-only — sushie's internal logic does allele alignment
+    # from the genotype dosages vs the GWAS effect/other alleles.
+    # Filter to biallelic SNPs (-m2 -M2 -v snps) to drop multi-allelic
+    # sites that would create duplicate IDs.
+    tmp_sub = out_vcf.with_suffix(".sub.vcf.gz")
+    rc = subprocess.call(["bcftools", "view",
+                           "-S", str(keep_file),
+                           "-m2", "-M2", "-v", "snps",
+                           "-Oz", "-o", str(tmp_sub),
+                           str(tmp_raw)])
+    if rc != 0:
+        sys.exit(f"ERROR: bcftools view failed (rc={rc})")
+    tmp_raw.unlink(missing_ok=True)
+    rc = subprocess.call([
+        "bcftools", "annotate",
+        "--set-id", "%CHROM:%POS",
+        "-Oz", "-o", str(out_vcf), str(tmp_sub)])
+    if rc != 0:
+        sys.exit(f"ERROR: bcftools annotate failed (rc={rc})")
+    tmp_sub.unlink(missing_ok=True)
+
+    rc = subprocess.call(["tabix", "-p", "vcf", str(out_vcf)])
+    if rc != 0:
+        sys.exit(f"ERROR: tabix index failed for {out_vcf}")
+    return out_vcf
 
 
 # ---------------------------- GWAS region mode (sumstats + ref VCF/PLINK) ----------------------------
@@ -407,12 +714,20 @@ def detect_and_convert_to_sushie_gwas(input_path: Path,
                     continue
             except (ValueError, IndexError):
                 continue
-            g.write(f"{chrom_i}\t{snp}\t{pos_int}\t{a1}\t{a0}\t{z:.6g}\n")
+            # Standardise SNP ID to plain `chr:pos`. The 1000G phase3 VCFs
+            # ship with ID=. so rsid joins fail; using alleles in the ID
+            # (chr:pos:A1:A0) is too strict — strand flips, allele
+            # ordering, and multi-allelic encodings drop most SNPs at the
+            # join. Position-only IDs maximise the SNP overlap; sushie's
+            # internal logic then handles allele alignment.
+            snp_id = f"{chrom_i}:{pos_int}"
+            g.write(f"{chrom_i}\t{snp_id}\t{pos_int}\t{a1}\t{a0}\t{z:.6g}\n")
             n_written += 1
     return n_written
 
 
-def run_region(args, repo_dir: Path) -> int:
+def run_region(args, repo_dir: Path,
+                venv_py: Optional[Path] = None) -> int:
     """Single-locus fine-mapping with sushie's `finemap --summary`.
     Sushie computes LD internally from --vcf / --plink / --bgen reference
     genotypes (no precomputed LD matrix required)."""
@@ -425,7 +740,7 @@ def run_region(args, repo_dir: Path) -> int:
         sys.exit(f"REFUSED: only {n} GWAS rows in the requested window; "
                  f"need at least 50 SNPs to fine-map")
 
-    cli = which_sushie_cli().split()
+    cli = which_sushie_cli(venv_py).split()
     cmd = cli + ["finemap",
                   "--summary",
                   "--gwas", str(sushie_gwas),
@@ -435,10 +750,20 @@ def run_region(args, repo_dir: Path) -> int:
                   "--start", str(args.start),
                   "--end", str(args.end),
                   "--output", str(args.out)]
-    # LD source: either a reference genotype panel (sushie computes LD) or
-    # a precomputed LD matrix.
-    if args.ref_vcf:
-        cmd += ["--vcf", *[str(p) for p in args.ref_vcf]]
+    # LD source resolution (in priority order):
+    #   1. Explicit --ref-vcf / --ref-plink / --ref-bgen / --ld
+    #   2. --ref-1000g <pop>: tabix-slice from 1000G FTP + subset samples
+    ref_vcf_paths = list(args.ref_vcf or [])
+    if args.ref_1000g and not ref_vcf_paths and not args.ref_plink and \
+            not args.ref_bgen and not args.ld:
+        sliced = ensure_1000g_slice(args.chrom, args.start, args.end,
+                                      population=args.ref_1000g,
+                                      build=args.ref_1000g_build)
+        ref_vcf_paths = [sliced]
+        print(f"[finemap region] 1000G {args.ref_1000g.upper()} "
+              f"slice -> {sliced}", file=sys.stderr)
+    if ref_vcf_paths:
+        cmd += ["--vcf", *[str(p) for p in ref_vcf_paths]]
     elif args.ref_plink:
         cmd += ["--plink", *[str(p) for p in args.ref_plink]]
     elif args.ref_bgen:
@@ -447,9 +772,11 @@ def run_region(args, repo_dir: Path) -> int:
         cmd += ["--ld", *[str(p) for p in args.ld]]
     else:
         sys.exit("REFUSED: provide one of --ref-vcf / --ref-plink / "
-                 "--ref-bgen / --ld for the LD source")
+                 "--ref-bgen / --ld / --ref-1000g for the LD source")
     if args.extra:
-        cmd += args.extra
+        # Drop the literal `--` separator that argparse REMAINDER captures
+        # but the underlying sushie CLI doesn't accept.
+        cmd += [a for a in args.extra if a != "--"]
 
     print(f"[finemap region] {' '.join(cmd)}", file=sys.stderr)
     rc = subprocess.call(cmd)
@@ -728,6 +1055,18 @@ def main() -> int:
     preg.add_argument("--ref-bgen", dest="ref_bgen", type=Path, nargs="+",
                       help="Reference genotype BGEN 1.3 file(s) "
                            "(alternative to --ref-vcf)")
+    preg.add_argument("--ref-1000g", dest="ref_1000g", type=str,
+                      choices=list(_POP_TO_SUPERPOP),
+                      help="Convenience: auto-fetch the 1000G phase3 "
+                           "VCF slice for the given super-population "
+                           "(eur/eas/afr/sas/amr) at --chrom:--start-end, "
+                           "subset to that population, and use it as the "
+                           "LD reference. Installs htslib + bcftools on "
+                           "first use; caches the slice under "
+                           "~/.cache/finemap/1000g_<build>_<pop>/.")
+    preg.add_argument("--ref-1000g-build", dest="ref_1000g_build",
+                      type=str, choices=["hg19", "hg38"], default="hg19",
+                      help="Build for --ref-1000g (default: hg19)")
     preg.add_argument("--ld", type=Path, nargs="+",
                       help="Pre-computed LD matrix (tsv/tsv.gz) — bypasses "
                            "the reference-genotype LD computation")
@@ -788,8 +1127,8 @@ def main() -> int:
     if args.verify_install:
         repo_dir = ensure_repo(DEFAULT_REPO, None,
                                 CACHE_ROOT, refresh=False)
-        ensure_sushie_installed(repo_dir)
-        return verify_install(repo_dir)
+        venv_py = ensure_sushie_installed(repo_dir)
+        return verify_install(repo_dir, venv_py=venv_py)
 
     if args.subcmd not in ("susie", "sushie", "sumstats", "region"):
         p.print_help(sys.stderr)
@@ -801,18 +1140,18 @@ def main() -> int:
     # Common setup.
     repo_dir = ensure_repo(args.repo_url, args.commit,
                             Path(args.repo_cache), refresh=args.refresh)
-    ensure_sushie_installed(repo_dir)
+    venv_py = ensure_sushie_installed(repo_dir)
 
     # First-run verify-install gate.
     if args.refresh or args.re_verify or not is_verified():
-        rc = verify_install(repo_dir)
+        rc = verify_install(repo_dir, venv_py=venv_py)
         if rc != 0:
             sys.exit("verify-install failed; refusing to proceed with user run")
 
     if args.subcmd == "sumstats":
         return run_sumstats(args, repo_dir)
     if args.subcmd == "region":
-        return run_region(args, repo_dir)
+        return run_region(args, repo_dir, venv_py=venv_py)
 
     # Validate ancestry count vs subcommand.
     if args.subcmd == "susie" and len(args.vcf) != 1:
@@ -827,7 +1166,7 @@ def main() -> int:
     if args.covar and len(args.covar) != len(args.vcf):
         p.error("number of --covar files must match number of --vcf files")
 
-    return run_finemap(args, args.subcmd, repo_dir)
+    return run_finemap(args, args.subcmd, repo_dir, venv_py=venv_py)
 
 
 if __name__ == "__main__":
