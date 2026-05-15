@@ -859,13 +859,71 @@ def run_region(args, repo_dir: Path,
         print(f"summary: {summary.get('n_cs', '?')} CSs, "
               f"mean size {summary.get('mean_cs_size', '?')}, "
               f"max PIP {summary.get('max_pip', '?')}")
-        # Print the rsID-enriched credible-set table.
-        _print_cs_summary_table(Path(args.out), extras_sidecar)
+        # Print the rsID-enriched credible-set table, optionally with
+        # gnomAD + GTEx annotations appended.
+        annot_sources: set = set()
+        if args.annotate in ("gnomad", "both"):
+            annot_sources.add("gnomad")
+        if args.annotate in ("gtex", "both"):
+            annot_sources.add("gtex")
+        _print_cs_summary_table(Path(args.out), extras_sidecar,
+                                  annot_sources=annot_sources)
     return rc
 
 
+_ANNOT_CACHE = Path.home() / ".cache" / "variant-annotate"
+
+
+def _load_variant_annotate():
+    """Import variant-annotate/scripts/annotate.py as a module. The
+    variant-annotate skill lives as a sibling directory under
+    statgen-skills/. Returns the module, or None if not findable."""
+    # finemap.py is at: statgen-skills/finemap/scripts/finemap.py
+    # variant-annotate annotate.py is at:
+    #         statgen-skills/variant-annotate/scripts/annotate.py
+    here = Path(__file__).resolve().parent  # statgen-skills/finemap/scripts
+    sibling = here.parent.parent / "variant-annotate" / "scripts"
+    if not (sibling / "annotate.py").exists():
+        return None
+    if str(sibling) not in sys.path:
+        sys.path.insert(0, str(sibling))
+    try:
+        import annotate as va_mod  # noqa
+        return va_mod
+    except Exception as e:
+        sys.stderr.write(f"[finemap annotate] failed to import "
+                          f"variant-annotate: {type(e).__name__}: {e}\n")
+        return None
+
+
+def _annotate_variants(rsids: list, sources: set) -> dict:
+    """Fetch gnomAD and/or GTEx annotations for rsIDs by delegating to
+    the sibling `variant-annotate` skill. Returns
+    {rsid: {gnomad: dict, gtex: dict}}, empty dict if the skill isn't
+    available. Per-rsID JSON is cached by variant-annotate under
+    ~/.cache/variant-annotate/."""
+    va = _load_variant_annotate()
+    if va is None:
+        sys.stderr.write("[finemap annotate] variant-annotate skill not "
+                          "found alongside finemap; skipping annotations\n")
+        return {}
+    records = va.annotate_rsids(list(rsids), set(sources), _ANNOT_CACHE)
+    out: dict = {}
+    for rec in records:
+        rsid = rec.get("rsid")
+        bundle: dict = {}
+        if "gnomad" in sources and rec.get("gnomad"):
+            bundle["gnomad"] = rec["gnomad"]
+        if "gtex" in sources and rec.get("gtex"):
+            bundle["gtex"] = rec["gtex"]
+        if rsid and bundle:
+            out[rsid] = bundle
+    return out
+
+
 def _print_cs_summary_table(out_prefix: Path,
-                             extras_sidecar: Path) -> None:
+                             extras_sidecar: Path,
+                             annot_sources: Optional[set] = None) -> None:
     """Print a human-readable rsID-enriched credible-set table to stdout.
 
     Reads sushie's `<prefix>.sushie.cs.tsv` (which carries CSIndex, snp,
@@ -914,15 +972,55 @@ def _print_cs_summary_table(out_prefix: Path,
     if not rows:
         return
     rows.sort(key=lambda x: (x[0], x[1]))
+
+    # Optional: fetch gnomAD + GTEx annotations for every CS-member rsid.
+    annots = {}
+    if annot_sources:
+        rsids = sorted({r[7] for r in rows
+                        if r[7] and r[7] != "NA" and r[7].startswith("rs")})
+        if rsids:
+            print(f"[finemap annotate] querying "
+                  f"{','.join(sorted(annot_sources))} for {len(rsids)} "
+                  f"variants (cached to {_ANNOT_CACHE}) ...",
+                  file=sys.stderr)
+            annots = _annotate_variants(rsids, annot_sources)
+
     # Render markdown-style table.
     print()
     print("Credible-set members (sorted by CS, descending PIP within CS):")
     print()
-    print("| CS | PIP | rsID | chr:pos | Eff | NonEff | Beta | SE | P |")
-    print("|---|---|---|---|---|---|---|---|---|")
+    base_cols = ["CS", "PIP", "rsID", "chr:pos", "Eff", "NonEff",
+                  "Beta", "SE", "P"]
+    extra_cols = []
+    if "gnomad" in (annot_sources or set()):
+        extra_cols += ["Csq", "Gene", "AF_nfe"]
+    if "gtex" in (annot_sources or set()):
+        extra_cols += ["top eQTL", "top sQTL"]
+    cols = base_cols + extra_cols
+    print("| " + " | ".join(cols) + " |")
+    print("|" + "|".join("---" for _ in cols) + "|")
     for cs, _, chrpos, pos, a0, a1, pip, rsid, beta, se, p in rows:
-        print(f"| {cs} | {pip:.4f} | {rsid} | {chrpos} | "
-              f"{a1} | {a0} | {beta} | {se} | {p} |")
+        row = [str(cs), f"{pip:.4f}", rsid, chrpos, a1, a0,
+                beta, se, p]
+        rec = annots.get(rsid, {})
+        if "gnomad" in (annot_sources or set()):
+            g = rec.get("gnomad") or {}
+            csq = (g.get("consequence") or "").replace("_variant", "")
+            gene = g.get("gene") or ""
+            af_nfe = g.get("af", {}).get("nfe")
+            af_str = f"{af_nfe:.4g}" if isinstance(af_nfe, (int, float)) \
+                else ""
+            row += [csq, gene, af_str]
+        if "gtex" in (annot_sources or set()):
+            t = rec.get("gtex") or {}
+            eq = t.get("top_eqtl") or {}
+            sq = t.get("top_sqtl") or {}
+            eq_str = (f"{eq.get('gene')}@{eq.get('tissue')} "
+                       f"p={eq.get('p'):.1e}") if eq.get("gene") else ""
+            sq_str = (f"{sq.get('gene')}@{sq.get('tissue')} "
+                       f"p={sq.get('p'):.1e}") if sq.get("gene") else ""
+            row += [eq_str, sq_str]
+        print("| " + " | ".join(row) + " |")
     print()
 
 
@@ -1181,6 +1279,16 @@ def main() -> int:
     preg.add_argument("--okg-ld-panel-id", dest="okg_ld_panel_id", type=str,
                       help="OKG ld_panel node ID for the reference "
                            "genotypes (recorded in the manifest)")
+    preg.add_argument("--annotate", type=str, default="both",
+                      choices=["none", "gnomad", "gtex", "both"],
+                      help="Post-fine-mapping variant annotation, delegated "
+                           "to the sibling `variant-annotate` skill. "
+                           "`gnomad` adds most-severe consequence + gene + "
+                           "NFE allele frequency. `gtex` adds top eQTL + "
+                           "sQTL across tissues. `both` (default) adds both "
+                           "column groups to the CS summary table. Network "
+                           "calls; responses cached at "
+                           "~/.cache/variant-annotate/.")
     preg.add_argument("--repo-url", type=str, default=DEFAULT_REPO)
     preg.add_argument("--sushie-commit", dest="commit", type=str, default=None)
     preg.add_argument("--repo-cache", type=Path, default=CACHE_ROOT)
